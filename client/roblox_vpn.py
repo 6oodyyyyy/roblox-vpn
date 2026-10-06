@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v18"
+APP_VERSION = "v19"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -662,6 +662,30 @@ peer: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy=
 
 STEALTH_IFNAME = "RobloxVPN-Stealth"
 STEALTH_EXE = "stealth-wg.exe"
+
+
+def _recycle_wintun_driver():
+    """Restart the Wintun driver service to unstick a wedged driver.
+
+    WintunCreateAdapter can block forever when the driver is in a bad
+    state (observed on user PC: wintun.dll logs 'Creating adapter' and
+    never returns). A service recycle clears it. Safe when no other VPN
+    is actively connected. Never raises; returns True if the driver is
+    (now) running.
+    """
+    _stealth_log("checking wintun driver service ...")
+    ok, out = _run(["sc", "query", "wintun"], timeout=10)
+    _stealth_log("sc query wintun: ok=%s out=%s" % (ok, out.strip()[:120]))
+    if not ok and "1060" in out:
+        _stealth_log("wintun service not installed; dll will install it")
+        return True
+    ok, out = _run(["sc", "stop", "wintun"], timeout=15)
+    _stealth_log("sc stop wintun: ok=%s out=%s" % (ok, out.strip()[:120]))
+    time.sleep(2)
+    ok, out = _run(["sc", "start", "wintun"], timeout=15)
+    _stealth_log("sc start wintun: ok=%s out=%s" % (ok, out.strip()[:120]))
+    time.sleep(2)
+    return ok
 WINTUN_DLL = "wintun.dll"
 
 
@@ -770,6 +794,9 @@ class StealthBackend:
         if not ok:
             raise TunnelError(msg)
         self.disconnect()  # clean slate
+        # unstick the Wintun driver before asking it for an adapter --
+        # a wedged driver blocks CreateAdapter forever (no reboot needed)
+        _recycle_wintun_driver()
         ip = _conf_address(conf)
         _stealth_log("tunnel IP from conf: %s" % ip)
         if not ip:
@@ -2080,6 +2107,12 @@ def run_self_tests():
     check("stealth popen unpacks no_window",
           "creationflags=_no_window()" not in _src
           and "**_no_window()" in _src)
+    # wintun driver recycle must never raise (sc missing on linux is fine)
+    try:
+        r = _recycle_wintun_driver()
+        check("recycle_wintun_driver safe", isinstance(r, bool))
+    except Exception as e:  # noqa: BLE001
+        check("recycle_wintun_driver safe", False, repr(e))
 
     print("\n%d/%d tests passed" % (total[0] - len(fails), total[0]))
     if fails:
