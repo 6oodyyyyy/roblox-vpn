@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+"""
+RobloxVPN - a minimal-data, split-tunnel VPN client for unblocking Roblox.
+
+How it works
+------------
+Drives the official AmneziaWG Windows client (``amneziawg.exe`` / ``awg.exe``)
+to bring an obfuscated WireGuard tunnel up/down as a Windows service
+(``AmneziaWGTunnel$roblox``). Only Roblox traffic (AS22697) is routed through
+the tunnel -- everything else stays on the direct connection, so metered-data
+usage stays minimal. Full-tunnel configs are rejected on import.
+
+Usage
+-----
+    RobloxVPN.exe              start the tray app (self-elevates to admin)
+    RobloxVPN.exe --mock       dry-run mode: no admin, no real tunnel
+    RobloxVPN.exe --self-test  run built-in logic tests and exit
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+APP_NAME = "RobloxVPN"
+TUNNEL_NAME = "roblox"
+SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
+
+# Roblox network footprint, grounded in ipinfo.io WHOIS (ARIN NET-128-116-0-0-1,
+# OrgName "Roblox", ASN AS22697 -> 128.116.0.0/17). WARNING: 128.116.128.0/17 is
+# AS35612 (EOLO S.p.A.), NOT Roblox -- never add it.
+ROBLOX_ALLOWED_IPS = ["128.116.0.0/17"]
+
+# Roblox endpoints that must resolve through the tunnel's network path.
+# (Website/API = TCP 443, game servers = UDP 49152-65535; the CDN hosts below
+# are only needed by the launcher and normally work direct, but resolving them
+# here documents the full footprint.)
+ROBLOX_HOSTS = [
+    "www.roblox.com",
+    "api.roblox.com",
+    "setup.roblox.com",
+    "setup.rbxcdn.com",
+    "clientsettings.roblox.com",
+]
+
+DEFAULT_PORT = 443          # UDP 443 is less conspicuous than 51820
+DEFAULT_MTU = 1420
+CLIENT_ADDRESS = "10.8.0.2/32"
+SERVER_NETWORK = "10.8.0.0/24"
+PERSISTENT_KEEPALIVE = 25   # seconds; keeps NAT mapping alive, ~bytes/min
+
+
+def _app_dir():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, APP_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+APP_DIR = None  # resolved lazily so --self-test works without touching disk
+def app_dir():
+    global APP_DIR
+    if APP_DIR is None:
+        APP_DIR = _app_dir()
+    return APP_DIR
+
+
+def conf_path():
+    return os.path.join(app_dir(), TUNNEL_NAME + ".conf")
+
+
+def stats_path():
+    return os.path.join(app_dir(), "stats.json")
+
+
+def settings_path():
+    return os.path.join(app_dir(), "settings.json")
+
+
+# ---------------------------------------------------------------------------
+# Small pure helpers (covered by --self-test)
+# ---------------------------------------------------------------------------
+
+def fmt_bytes(n):
+    """Human-readable byte count, e.g. 1536 -> '1.5 KB'."""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%d %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+def parse_transfer_amount(amount, unit):
+    """Convert e.g. ('6.55', 'KiB') to bytes."""
+    mult = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3,
+            "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
+    return int(float(amount) * mult.get(unit.upper(), 1))
+
+
+def parse_awg_show(text):
+    """Parse `awg show <tunnel>` output.
+
+    Returns dict(rx_bytes, tx_bytes, handshake, endpoint) or None if the
+    tunnel is not up.
+    """
+    if not text or "interface:" not in text:
+        return None
+    m = re.search(
+        r"transfer:\s*([\d.]+)\s*([KMGT]?i?B)\s*received,\s*"
+        r"([\d.]+)\s*([KMGT]?i?B)\s*sent",
+        text, re.IGNORECASE)
+    if not m:
+        return None
+    hs = re.search(r"latest handshake:\s*(.+)", text)
+    ep = re.search(r"endpoint:\s*(\S+)", text)
+    return {
+        "rx_bytes": parse_transfer_amount(m.group(1), m.group(2)),
+        "tx_bytes": parse_transfer_amount(m.group(3), m.group(4)),
+        "handshake": hs.group(1).strip() if hs else "?",
+        "endpoint": ep.group(1).strip() if ep else "?",
+    }
+
+
+def random_obfuscation(rng=None):
+    """Random AmneziaWG handshake-obfuscation params (must match the server)."""
+    r = rng or random.SystemRandom()
+    jmin = r.randint(20, 60)
+    return {
+        "Jc": r.randint(3, 10),
+        "Jmin": jmin,
+        "Jmax": jmin + r.randint(10, 60),
+        "S1": r.randint(15, 127),
+        "S2": r.randint(15, 127),
+        "S3": r.randint(15, 127),
+        "S4": r.randint(15, 127),
+        "H1": r.randint(1, 2 ** 32 - 1),
+        "H2": r.randint(1, 2 ** 32 - 1),
+        "H3": r.randint(1, 2 ** 32 - 1),
+        "H4": r.randint(1, 2 ** 32 - 1),
+    }
+
+
+def generate_private_key():
+    """Generate a WireGuard private key (base64, 44 chars)."""
+    import base64
+    return base64.b64encode(random.SystemRandom().randbytes(32)).decode()
+
+
+def generate_config(server_host, server_port, server_pubkey, client_privkey,
+                    psk=None, address=CLIENT_ADDRESS, mtu=DEFAULT_MTU,
+                    allowed_ips=None, obf=None,
+                    keepalive=PERSISTENT_KEEPALIVE):
+    """Build an AmneziaWG client .conf (split-tunnel, Roblox only)."""
+    allowed_ips = allowed_ips or ROBLOX_ALLOWED_IPS
+    obf = obf or random_obfuscation()
+    lines = [
+        "[Interface]",
+        "PrivateKey = " + client_privkey.strip(),
+        "Address = " + address,
+        "MTU = %d" % mtu,
+        "Jc = %d" % obf["Jc"],
+        "Jmin = %d" % obf["Jmin"],
+        "Jmax = %d" % obf["Jmax"],
+        "S1 = %d" % obf["S1"],
+        "S2 = %d" % obf["S2"],
+        "S3 = %d" % obf["S3"],
+        "S4 = %d" % obf["S4"],
+        "H1 = %d" % obf["H1"],
+        "H2 = %d" % obf["H2"],
+        "H3 = %d" % obf["H3"],
+        "H4 = %d" % obf["H4"],
+        "",
+        "[Peer]",
+        "PublicKey = " + server_pubkey.strip(),
+    ]
+    if psk:
+        lines.append("PresharedKey = " + psk.strip())
+    lines += [
+        "Endpoint = %s:%d" % (server_host.strip(), int(server_port)),
+        "AllowedIPs = " + ", ".join(allowed_ips),
+        "PersistentKeepalive = %d" % keepalive,
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _split_allowed_ips(text):
+    vals = []
+    for sec in re.finditer(
+            r"^\[Peer\](.*?)(?=^\[|\Z)", text, re.MULTILINE | re.DOTALL):
+        for m in re.finditer(r"^AllowedIPs\s*=\s*(.+)$", sec.group(1),
+                             re.MULTILINE | re.IGNORECASE):
+            vals += [v.strip() for v in m.group(1).split(",") if v.strip()]
+    return vals
+
+
+def validate_config_text(text, allow_full_tunnel=False):
+    """Validate an imported .conf. Returns (ok, errors, warnings)."""
+    errors, warnings = [], []
+    if "[Interface]" not in text:
+        errors.append("missing [Interface] section")
+    if "[Peer]" not in text:
+        errors.append("missing [Peer] section")
+    if not re.search(r"^PrivateKey\s*=\s*\S+", text, re.MULTILINE):
+        errors.append("missing PrivateKey in [Interface]")
+    if not re.search(r"^PublicKey\s*=\s*\S+", text, re.MULTILINE):
+        errors.append("missing PublicKey in [Peer]")
+    if not re.search(r"^Endpoint\s*=\s*\S+:\d+", text, re.MULTILINE):
+        errors.append("missing or malformed Endpoint (host:port) in [Peer]")
+    allowed = _split_allowed_ips(text)
+    if not allowed:
+        errors.append("missing AllowedIPs in [Peer]")
+    full = [a for a in allowed if a in ("0.0.0.0/0", "::/0")]
+    if full and not allow_full_tunnel:
+        errors.append(
+            "FULL-TUNNEL config (%s) rejected: this app is split-tunnel only "
+            "(Roblox traffic). Full tunnel burns metered data." % ", ".join(full))
+    if allowed and not any(a in ROBLOX_ALLOWED_IPS for a in allowed):
+        warnings.append(
+            "AllowedIPs does not include the Roblox range %s; Roblox may not "
+            "be routed through the tunnel." % ", ".join(ROBLOX_ALLOWED_IPS))
+    has_awg = any(k in text for k in ("Jc =", "Jc=", "S1 =", "S1="))
+    if not has_awg:
+        warnings.append(
+            "no AmneziaWG obfuscation params (Jc/S1..) found -- plain "
+            "WireGuard config. It will work with the AmneziaWG client, but "
+            "the handshake is easier for DPI to fingerprint.")
+    return (not errors, errors, warnings)
+
+# ---------------------------------------------------------------------------
+# Tunnel backends
+# ---------------------------------------------------------------------------
+
+class TunnelError(Exception):
+    pass
+
+
+def _run(cmd, timeout=30):
+    """Run a command, return (ok, stdout+stderr). Never raises."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return False, "not found: %s" % cmd[0]
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+class AmneziaWGBackend:
+    """Drives the official AmneziaWG Windows client programmatically.
+
+    Uses (documented in amneziawg-windows-client/docs/enterprise.md):
+      amneziawg /installtunnelservice <conf>    -> service AmneziaWGTunnel$<name>
+      amneziawg /uninstalltunnelservice <name>
+      sc start/stop AmneziaWGTunnel$<name>
+      awg show <name>                            -> handshake + transfer stats
+    Requires administrator rights.
+    """
+    name = "amneziawg"
+
+    def __init__(self):
+        self.amneziawg = None
+        self.awg = None
+
+    def available(self):
+        cands = [shutil.which("amneziawg"), shutil.which("awg")]
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        for exe in ("amneziawg.exe", "awg.exe"):
+            p = os.path.join(pf, "AmneziaWG", exe)
+            if os.path.isfile(p):
+                cands.append(p)
+        self.amneziawg = next((c for c in cands if c and "amneziawg" in
+                               os.path.basename(c).lower()), None)
+        self.awg = next((c for c in cands if c and os.path.basename(c).lower()
+                         == "awg.exe"), None)
+        if not self.amneziawg:
+            return (False,
+                    "AmneziaWG client not found. Install it from:\n"
+                    "https://github.com/amnezia-vpn/amneziawg-windows-client\n"
+                    "(Releases page), then restart this app.")
+        if not self.awg:
+            return (False,
+                    "awg.exe not found next to amneziawg.exe -- reinstall the "
+                    "AmneziaWG client.")
+        return True, ""
+
+    def connect(self, conf):
+        ok, out = _run([self.amneziawg, "/installtunnelservice", conf])
+        if not ok and "already exists" not in out.lower():
+            raise TunnelError("installtunnelservice failed:\n" + out.strip())
+        # Never auto-start on boot: this app manages the tunnel explicitly so
+        # it can never silently burn metered data.
+        _run(["sc", "config", SERVICE_NAME, "start=", "demand"])
+        ok, out = _run(["sc", "start", SERVICE_NAME])
+        if not ok and "already" not in out.lower() and "1060" not in out:
+            raise TunnelError("could not start tunnel service:\n" + out.strip())
+
+    def disconnect(self):
+        _run(["sc", "stop", SERVICE_NAME])
+        ok, out = _run([self.amneziawg, "/uninstalltunnelservice", TUNNEL_NAME])
+        if not ok and "1060" not in out and "does not exist" not in out.lower():
+            raise TunnelError("uninstalltunnelservice failed:\n" + out.strip())
+
+    def get_stats(self):
+        ok, out = _run([self.awg, "show", TUNNEL_NAME])
+        if not ok:
+            return None
+        return parse_awg_show(out)
+
+
+class MockBackend:
+    """Dry-run backend: simulates a tunnel for testing without a server.
+
+    Parses a realistic `awg show` sample with the same parser as the real
+    backend, then simulates growing transfer counters.
+    """
+    name = "mock"
+    SAMPLE = """interface: roblox
+  public key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=
+  private key: (hidden)
+  listening port: 51820
+peer: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy=
+  endpoint: 203.0.11.5:443
+  allowed ips: 128.116.0.0/17
+  latest handshake: 4 seconds ago
+  transfer: 6.55 KiB received, 4.13 KiB sent
+"""
+
+    def __init__(self):
+        self._up = False
+        self._rx = 6707
+        self._tx = 4229
+        self._t0 = 0.0
+
+    def available(self):
+        return True, ""
+
+    def connect(self, conf):
+        if not os.path.isfile(conf):
+            raise TunnelError("mock: config not found: %s" % conf)
+        self._up = True
+        self._t0 = time.time()
+        self._up_at = time.time()
+
+    def disconnect(self):
+        self._up = False
+
+    def get_stats(self):
+        if not self._up:
+            return None
+        # Simulate modest Roblox traffic (~30 KB/s down, ~8 KB/s up).
+        dt = time.time() - self._t0
+        self._t0 = time.time()
+        self._rx += int(dt * 30 * 1024 * (0.7 + random.random() * 0.6))
+        self._tx += int(dt * 8 * 1024 * (0.7 + random.random() * 0.6))
+        base = parse_awg_show(self.SAMPLE)
+        base["rx_bytes"] = self._rx
+        base["tx_bytes"] = self._tx
+        base["handshake"] = "%d seconds ago" % max(
+            1, int(time.time() - self._up_at) % 120 + 1)
+        return base
+
+
+# ---------------------------------------------------------------------------
+# Persistent stats + settings
+# ---------------------------------------------------------------------------
+
+def load_stats():
+    try:
+        with open(stats_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        return {"rx": int(d.get("rx", 0)), "tx": int(d.get("tx", 0))}
+    except (OSError, ValueError):
+        return {"rx": 0, "tx": 0}
+
+
+def save_stats(rx, tx):
+    try:
+        with open(stats_path(), "w", encoding="utf-8") as f:
+            json.dump({"rx": int(rx), "tx": int(tx)}, f)
+    except OSError:
+        pass
+
+
+def load_settings():
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(s):
+    try:
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Elevation (Windows)
+# ---------------------------------------------------------------------------
+
+def is_admin():
+    if os.name != "nt":
+        return True  # mock/self-test on other platforms
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def relaunch_elevated(argv):
+    import ctypes
+    exe = sys.executable
+    params = " ".join('"%s"' % a for a in argv)
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+
+# ---------------------------------------------------------------------------
+# App state + tray UI
+# ---------------------------------------------------------------------------
+
+def _make_icon(connected, stale=False):
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if connected and not stale:
+        color = (46, 160, 67)      # green
+    elif connected:
+        color = (218, 165, 32)     # amber: up but no recent handshake
+    else:
+        color = (110, 110, 110)    # gray
+    d.ellipse([10, 10, 54, 54], fill=color)
+    d.ellipse([24, 24, 40, 40], fill=(255, 255, 255, 230))
+    return img
+
+
+def _conf_endpoint():
+    try:
+        with open(conf_path(), encoding="utf-8") as f:
+            m = re.search(r"^Endpoint\s*=\s*(\S+)", f.read(), re.MULTILINE)
+            return m.group(1) if m else "?"
+    except OSError:
+        return "?"
+
+
+class VpnApp:
+    def __init__(self, mock=False):
+        self.settings = load_settings()
+        self.totals = load_stats()
+        self.mock = mock
+        self.backend = MockBackend() if mock else AmneziaWGBackend()
+        self.connected = False
+        self.base_rx = self.base_tx = 0
+        self.sess_rx = self.sess_tx = 0
+        self.last_handshake = None
+        self.status_msg = "Starting..."
+        self.icon = None
+        self.root = None
+        self.dash_win = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        ok, msg = self.backend.available()
+        self.backend_ok = ok
+        self.backend_msg = msg
+        if not ok and not mock:
+            self.status_msg = "AmneziaWG client missing"
+
+    # -- connection control -------------------------------------------
+    def do_connect(self):
+        def _work():
+            if not os.path.isfile(conf_path()):
+                self._notify("No config",
+                             "Import a .conf file or generate one first.")
+                return
+            if not self.backend_ok:
+                self._notify("Backend missing", self.backend_msg)
+                return
+            self.status_msg = "Connecting..."
+            try:
+                self.backend.connect(conf_path())
+            except TunnelError as e:
+                self.status_msg = "Connect failed"
+                self._notify("Connect failed", str(e)[:300])
+                return
+            # wait for a real handshake
+            st = None
+            for _ in range(15):
+                time.sleep(1)
+                st = self.backend.get_stats()
+                if st and "ago" in st.get("handshake", ""):
+                    break
+            if not st:
+                self.status_msg = "No handshake yet"
+                self._notify("Connected?", "Tunnel is up but no handshake "
+                             "from the server yet. Check the server.")
+            with self._lock:
+                self.connected = True
+                self.base_rx = (st or {}).get("rx_bytes", 0)
+                self.base_tx = (st or {}).get("tx_bytes", 0)
+                self.sess_rx = self.sess_tx = 0
+                self.last_handshake = (st or {}).get("handshake")
+                self.status_msg = "Connected (%s)" % (
+                    self.last_handshake or "?")
+            self._notify("RobloxVPN connected",
+                         "Split tunnel up. Only Roblox traffic uses it.")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def do_disconnect(self):
+        def _work():
+            try:
+                self.backend.disconnect()
+            except TunnelError as e:
+                self._notify("Disconnect issue", str(e)[:300])
+            with self._lock:
+                self.connected = False
+                self.status_msg = "Disconnected"
+            self._notify("RobloxVPN disconnected",
+                         "Session: down %s / up %s" % (
+                             fmt_bytes(self.sess_rx), fmt_bytes(self.sess_tx)))
+        threading.Thread(target=_work, daemon=True).start()
+
+    # -- polling --------------------------------------------------------
+    def _poll_loop(self):
+        while not self._stop.wait(2.0):
+            try:
+                self._poll_once()
+            except Exception:  # noqa: BLE001 - never kill the poll thread
+                pass
+            self._refresh_tray()
+
+    def _poll_once(self):
+        with self._lock:
+            if not self.connected:
+                return
+        st = self.backend.get_stats()
+        with self._lock:
+            if not self.connected:
+                return
+            if st is None:
+                self.status_msg = "Tunnel down?"
+                return
+            rx, tx = st["rx_bytes"], st["tx_bytes"]
+            drx = rx - self.base_rx if rx >= self.base_rx else rx
+            dtx = tx - self.base_tx if tx >= self.base_tx else tx
+            self.base_rx, self.base_tx = rx, tx
+            self.sess_rx += drx
+            self.sess_tx += dtx
+            self.totals["rx"] += drx
+            self.totals["tx"] += dtx
+            save_stats(self.totals["rx"], self.totals["tx"])
+            self.last_handshake = st.get("handshake")
+            stale = self.last_handshake == "Never" or not self.last_handshake
+            self._stale = stale
+            self.status_msg = ("Connected (%s)" % self.last_handshake
+                               if not stale else "Connected (no handshake)")
+
+    # -- tray -----------------------------------------------------------
+    def _menu(self):
+        from pystray import Menu, MenuItem
+        with self._lock:
+            connected = self.connected
+            sess = "Session  down %s / up %s" % (fmt_bytes(self.sess_rx),
+                                                 fmt_bytes(self.sess_tx))
+            tot = "Total  down %s / up %s" % (fmt_bytes(self.totals["rx"]),
+                                              fmt_bytes(self.totals["tx"]))
+            status = self.status_msg
+            mode = "mock" if self.mock else "amneziawg"
+        items = [
+            MenuItem(status, None, enabled=False),
+            MenuItem(sess, None, enabled=False),
+            MenuItem(tot, None, enabled=False),
+            MenuItem("mode: %s" % mode, None, enabled=False),
+            MenuItem("---", None, enabled=False),
+        ]
+        if connected:
+            items.append(MenuItem("Disconnect", lambda i: self.do_disconnect()))
+        else:
+            items.append(MenuItem("Connect", lambda i: self.do_connect()))
+        items += [
+            MenuItem("Open dashboard", lambda i: self.open_dashboard()),
+            MenuItem("Import .conf...", lambda i: self.import_dialog()),
+            MenuItem("Generate config...", lambda i: self.generate_dialog()),
+            MenuItem("Open config folder", lambda i: self.open_folder()),
+            MenuItem("---", None, enabled=False),
+            MenuItem("Quit", lambda i: self.quit()),
+        ]
+        return Menu(*items)
+
+    def _refresh_tray(self):
+        icon = self.icon
+        if icon is None:
+            return
+        try:
+            with self._lock:
+                connected = self.connected
+                stale = getattr(self, "_stale", False)
+                status = self.status_msg
+            icon.icon = _make_icon(connected, stale)
+            icon.title = "RobloxVPN - " + status
+            icon.menu = self._menu()
+            icon.update_menu()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _run_tray(self):
+        from pystray import Icon
+        self.icon = Icon("robloxvpn", _make_icon(False), "RobloxVPN",
+                         self._menu())
+        self.icon.run()
+
+    def _notify(self, title, msg):
+        try:
+            if self.icon:
+                self.icon.notify(msg, title)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- main loop ------------------------------------------------------
+    def run(self):
+        import tkinter as tk
+        from tkinter import messagebox
+        self.root = tk.Tk()
+        self.root.withdraw()
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+        threading.Thread(target=self._run_tray, daemon=True).start()
+        if not self.backend_ok and not self.mock:
+            # Give the tray a moment to appear, then explain.
+            self.root.after(1500, lambda: messagebox.showwarning(
+                "AmneziaWG client not found",
+                self.backend_msg + "\n\nThe tray icon is running; install the "
+                "client and restart this app to connect."))
+        self.root.mainloop()
+
+    def quit(self):
+        self._stop.set()
+        try:
+            if self.icon:
+                self.icon.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self.root:
+                self.root.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def open_folder(self):
+        if os.name == "nt":
+            os.startfile(app_dir())  # noqa: S606
+        else:
+            self._notify("Config folder", app_dir())
+
+# ---------------------------------------------------------------------------
+# Dashboard + dialogs (tkinter, lazy imports so --self-test stays stdlib-only)
+# ---------------------------------------------------------------------------
+
+def _v(app):
+    """Snapshot of display state (called from UI thread)."""
+    with app._lock:
+        return {
+            "status": app.status_msg,
+            "connected": app.connected,
+            "sess": (app.sess_rx, app.sess_tx),
+            "tot": (app.totals["rx"], app.totals["tx"]),
+            "endpoint": _conf_endpoint(),
+            "mode": "mock (dry-run)" if app.mock else "amneziawg",
+            "backend_ok": app.backend_ok,
+        }
+
+
+def _open_dashboard(app):
+    import tkinter as tk
+    from tkinter import messagebox
+    if app.dash_win is not None:
+        try:
+            app.dash_win.lift()
+            app.dash_win.focus_force()
+            return
+        except Exception:  # noqa: BLE001
+            app.dash_win = None
+    win = tk.Toplevel(app.root)
+    app.dash_win = win
+    win.title("RobloxVPN")
+    win.resizable(False, False)
+    win.configure(bg="#111111")
+    fg, dim, acc = "#f2f2f2", "#9a9a9a", "#2ea043"
+
+    def row(r, label):
+        tk.Label(win, text=label, fg=dim, bg="#111111",
+                 font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w",
+                                            padx=14, pady=3)
+        v = tk.Label(win, text="—", fg=fg, bg="#111111", font=("Segoe UI", 9,
+                                                               "bold"))
+        v.grid(row=r, column=1, sticky="w", padx=14, pady=3)
+        return v
+
+    vals = {}
+    vals["status"] = row(0, "Status")
+    vals["endpoint"] = row(1, "Server")
+    vals["mode"] = row(2, "Backend")
+    vals["sess"] = row(3, "This session")
+    vals["tot"] = row(4, "Total used")
+    note = tk.Label(win, text="Split tunnel: only Roblox traffic uses the VPN.",
+                    fg=dim, bg="#111111", font=("Segoe UI", 8))
+    note.grid(row=5, column=0, columnspan=2, padx=14, pady=(6, 2))
+
+    btn_frame = tk.Frame(win, bg="#111111")
+    btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
+    conn_btn = tk.Button(btn_frame, text="Connect", width=12, bg=acc,
+                         fg="white", font=("Segoe UI", 9, "bold"),
+                         command=lambda: (app.do_disconnect()
+                                          if _v(app)["connected"]
+                                          else app.do_connect()))
+    conn_btn.pack(side="left", padx=6)
+
+    def reset_totals():
+        if messagebox.askyesno("Reset counters",
+                               "Reset the lifetime data counters?"):
+            with app._lock:
+                app.totals = {"rx": 0, "tx": 0}
+                save_stats(0, 0)
+    tk.Button(btn_frame, text="Reset counters", width=12,
+              command=reset_totals).pack(side="left", padx=6)
+
+    adv = tk.BooleanVar(value=bool(app.settings.get("allow_full_tunnel")))
+    def _toggle_adv():
+        app.settings["allow_full_tunnel"] = bool(adv.get())
+        save_settings(app.settings)
+        if adv.get():
+            messagebox.showwarning(
+                "Full tunnel allowed",
+                "Full-tunnel configs (0.0.0.0/0) will now import. This routes "
+                "ALL traffic through the VPN and burns metered data fast.")
+    tk.Checkbutton(win, text="Allow full-tunnel configs (not recommended)",
+                   variable=adv, command=_toggle_adv, fg=dim, bg="#111111",
+                   selectcolor="#111111", activebackground="#111111",
+                   font=("Segoe UI", 8)).grid(row=7, column=0, columnspan=2,
+                                              padx=14, pady=(0, 10))
+
+    def refresh():
+        try:
+            if not win.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        s = _v(app)
+        vals["status"].config(text=s["status"],
+                              fg=acc if s["connected"] else fg)
+        vals["endpoint"].config(text=s["endpoint"])
+        vals["mode"].config(text=s["mode"] +
+                            ("" if s["backend_ok"] or app.mock
+                             else " - MISSING"))
+        vals["sess"].config(text="down %s / up %s" % (fmt_bytes(s["sess"][0]),
+                                                      fmt_bytes(s["sess"][1])))
+        vals["tot"].config(text="down %s / up %s" % (fmt_bytes(s["tot"][0]),
+                                                    fmt_bytes(s["tot"][1])))
+        conn_btn.config(text="Disconnect" if s["connected"] else "Connect")
+        app.root.after(1500, refresh)
+
+    def on_close():
+        app.dash_win = None
+        win.destroy()
+    win.protocol("WM_DELETE_WINDOW", on_close)
+    refresh()
+
+
+def _import_dialog(app):
+    from tkinter import filedialog, messagebox
+    p = filedialog.askopenfilename(
+        title="Import AmneziaWG / WireGuard config",
+        filetypes=[("Config files", "*.conf"), ("All files", "*.*")])
+    if not p:
+        return
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        messagebox.showerror("Import failed", str(e))
+        return
+    allow = bool(app.settings.get("allow_full_tunnel"))
+    ok, errors, warnings = validate_config_text(text, allow_full_tunnel=allow)
+    if not ok:
+        messagebox.showerror("Config rejected", "\n".join(errors))
+        return
+    if warnings and not messagebox.askyesno(
+            "Import with warnings?", "\n".join(warnings) +
+            "\n\nImport anyway?"):
+        return
+    try:
+        with open(conf_path(), "w", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+    except OSError as e:
+        messagebox.showerror("Import failed", str(e))
+        return
+    app._notify("Config imported", "Saved. Press Connect to bring it up.")
+
+
+def _generate_dialog(app):
+    import tkinter as tk
+    from tkinter import messagebox
+    win = tk.Toplevel(app.root)
+    win.title("Generate RobloxVPN config")
+    win.resizable(False, False)
+    fields = {}
+    def row(r, label, default="", width=44):
+        tk.Label(win, text=label).grid(row=r, column=0, sticky="w",
+                                      padx=10, pady=3)
+        e = tk.Entry(win, width=width)
+        e.insert(0, default)
+        e.grid(row=r, column=1, padx=10, pady=3)
+        fields[label] = e
+        return e
+    row(0, "Server IP / hostname", "")
+    row(1, "Port (UDP)", str(DEFAULT_PORT))
+    row(2, "Server public key", "")
+    row(3, "Client private key", generate_private_key())
+    row(4, "Preshared key (optional)", "")
+    row(5, "AllowedIPs", ", ".join(ROBLOX_ALLOWED_IPS))
+    obf = [random_obfuscation()]
+    obf_lbl = tk.Label(win, text="", fg="#555555", font=("Segoe UI", 8),
+                       wraplength=380, justify="left")
+    obf_lbl.grid(row=6, column=0, columnspan=2, padx=10, pady=3)
+    def show_obf():
+        o = obf[0]
+        obf_lbl.config(text="Obfuscation: Jc=%d Jmin=%d Jmax=%d S=%d,%d,%d,%d "
+                            "(H values hidden)" % (
+                                o["Jc"], o["Jmin"], o["Jmax"], o["S1"],
+                                o["S2"], o["S3"], o["S4"]))
+    show_obf()
+    btns = tk.Frame(win)
+    btns.grid(row=7, column=0, columnspan=2, pady=8)
+    tk.Button(btns, text="New client key",
+              command=lambda: (fields["Client private key"].delete(0, "end"),
+                               fields["Client private key"].insert(
+                                   0, generate_private_key()))).pack(side="left",
+                                                                    padx=4)
+    tk.Button(btns, text="Randomize obfuscation",
+              command=lambda: (obf.__setitem__(0, random_obfuscation()),
+                               show_obf())).pack(side="left", padx=4)
+    tk.Label(win, text="These values MUST match the server config.",
+             fg="#a00", font=("Segoe UI", 8)).grid(row=8, column=0,
+                                                  columnspan=2, pady=(0, 4))
+    def save(and_connect):
+        host = fields["Server IP / hostname"].get().strip()
+        port = fields["Port (UDP)"].get().strip()
+        spub = fields["Server public key"].get().strip()
+        cpriv = fields["Client private key"].get().strip()
+        psk = fields["Preshared key (optional)"].get().strip() or None
+        allowed = [a.strip() for a in fields["AllowedIPs"].get().split(",")
+                   if a.strip()]
+        if not host or not spub or not cpriv:
+            messagebox.showerror("Missing fields",
+                                 "Server host, server public key and client "
+                                 "private key are required.")
+            return
+        try:
+            port_i = int(port)
+            assert 1 <= port_i <= 65535
+        except (ValueError, AssertionError):
+            messagebox.showerror("Bad port", "Port must be 1-65535.")
+            return
+        text = generate_config(host, port_i, spub, cpriv, psk=psk,
+                               allowed_ips=allowed, obf=obf[0])
+        ok, errors, _ = validate_config_text(text)
+        if not ok:
+            messagebox.showerror("Generated config invalid",
+                                 "\n".join(errors))
+            return
+        with open(conf_path(), "w", encoding="utf-8") as f:
+            f.write(text)
+        win.destroy()
+        app._notify("Config saved", "Wrote %s" % conf_path())
+        if and_connect:
+            app.do_connect()
+    act = tk.Frame(win)
+    act.grid(row=9, column=0, columnspan=2, pady=(0, 10))
+    tk.Button(act, text="Save", width=12,
+              command=lambda: save(False)).pack(side="left", padx=4)
+    tk.Button(act, text="Save & Connect", width=14,
+              command=lambda: save(True)).pack(side="left", padx=4)
+
+
+# Attach dialog entry points to VpnApp (kept out of the class body for clarity)
+VpnApp.open_dashboard = lambda self: _open_dashboard(self)
+VpnApp.import_dialog = lambda self: _import_dialog(self)
+VpnApp.generate_dialog = lambda self: _generate_dialog(self)
+
+
+# ---------------------------------------------------------------------------
+# Self-test (runs on any platform, stdlib only)
+# ---------------------------------------------------------------------------
+
+SAMPLE_SHOW = """interface: roblox
+  public key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+  private key: (hidden)
+  listening port: 53488
+peer: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+  endpoint: 203.0.113.7:443
+  allowed ips: 128.116.0.0/17
+  latest handshake: 3 seconds ago
+  transfer: 6.55 KiB received, 4.13 KiB sent
+"""
+
+
+def run_self_tests():
+    fails = []
+    total = [0]
+
+    def check(name, cond, info=""):
+        total[0] += 1
+        print(("%s %s" % ("PASS" if cond else "FAIL", name)) +
+              (" -- " + info if info and not cond else ""))
+        if not cond:
+            fails.append(name)
+
+    check("fmt_bytes B", fmt_bytes(0) == "0 B")
+    check("fmt_bytes KB", fmt_bytes(1536) == "1.5 KB")
+    check("fmt_bytes MB", fmt_bytes(5 * 1024 ** 2) == "5.0 MB")
+    check("transfer KiB", parse_transfer_amount("6.55", "KiB") == 6707)
+    check("transfer MiB", parse_transfer_amount("2.5", "MiB") == 2621440)
+
+    st = parse_awg_show(SAMPLE_SHOW)
+    check("awg_show parsed", st is not None)
+    check("awg_show rx", st["rx_bytes"] == 6707, repr(st))
+    check("awg_show tx", st["tx_bytes"] == 4229, repr(st))
+    check("awg_show handshake", st["handshake"] == "3 seconds ago")
+    check("awg_show endpoint", st["endpoint"] == "203.0.113.7:443")
+    check("awg_show garbage -> None", parse_awg_show("nonsense") is None)
+    check("awg_show no transfer -> None",
+          parse_awg_show("interface: x\n  latest handshake: Never\n") is None)
+
+    rng = random.Random(42)
+    o = random_obfuscation(rng)
+    check("obf Jmax>Jmin", o["Jmax"] > o["Jmin"], repr(o))
+    check("obf ranges", 3 <= o["Jc"] <= 10 and 15 <= o["S1"] <= 127)
+    check("obf H uint32", all(1 <= o[k] <= 2 ** 32 - 1
+                              for k in ("H1", "H2", "H3", "H4")))
+
+    cfg = generate_config("203.0.113.7", 443, "SERVERPUBKEY==",
+                          "CLIENTPRIVKEY==", obf=o)
+    check("gen has Interface", "[Interface]" in cfg)
+    check("gen MTU", "MTU = 1420" in cfg)
+    check("gen endpoint port", "Endpoint = 203.0.113.7:443" in cfg)
+    check("gen split tunnel", "AllowedIPs = 128.116.0.0/17" in cfg)
+    check("gen no full tunnel", "0.0.0.0/0" not in cfg)
+    check("gen obfuscation", "Jc = %d" % o["Jc"] in cfg and "H4" in cfg)
+    check("gen keepalive", "PersistentKeepalive = 25" in cfg)
+
+    ok, errs, warns = validate_config_text(cfg)
+    check("validate good", ok and not errs, "; ".join(errs))
+
+    full = cfg.replace("AllowedIPs = 128.116.0.0/17",
+                       "AllowedIPs = 0.0.0.0/0, ::/0")
+    ok, errs, _ = validate_config_text(full)
+    check("reject full tunnel", not ok and any("FULL-TUNNEL" in e
+                                               for e in errs))
+    ok, errs, _ = validate_config_text(full, allow_full_tunnel=True)
+    check("allow full tunnel override", ok, "; ".join(errs))
+    ok, errs, _ = validate_config_text("[Interface]\nPrivateKey = x\n")
+    check("reject malformed", not ok and len(errs) >= 2, "; ".join(errs))
+    ok, _, warns = validate_config_text(
+        cfg.replace("128.116.0.0/17", "9.9.9.9/32"))
+    check("warn missing roblox range", ok and len(warns) > 0)
+    plain_wg = re.sub(r"^Jc.*\n|^Jmin.*\n|^Jmax.*\n|^S[1-4].*\n|^H[1-4].*\n",
+                      "", cfg, flags=re.MULTILINE)
+    ok, _, warns = validate_config_text(plain_wg)
+    check("warn plain wireguard", ok and any("obfuscation" in w
+                                             for w in warns))
+
+    # MockBackend cycle (uses a temp conf file)
+    import tempfile
+    mb = MockBackend()
+    check("mock available", mb.available()[0])
+    try:
+        mb.connect("/nonexistent/roblox.conf")
+        check("mock rejects missing conf", False)
+    except TunnelError:
+        check("mock rejects missing conf", True)
+    with tempfile.NamedTemporaryFile("w", suffix=".conf",
+                                     delete=False) as f:
+        f.write(cfg)
+        tmp = f.name
+    try:
+        mb.connect(tmp)
+        s1 = mb.get_stats()
+        time.sleep(0.05)
+        s2 = mb.get_stats()
+        check("mock stats grow",
+              s1 and s2 and s2["rx_bytes"] > s1["rx_bytes"])
+        mb.disconnect()
+        check("mock disconnect", mb.get_stats() is None)
+    finally:
+        os.unlink(tmp)
+
+    print("\n%d/%d tests passed" % (total[0] - len(fails), total[0]))
+    if fails:
+        print("FAILURES:", fails)
+        return 1
+    print("ALL SELF-TESTS PASSED")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog=APP_NAME,
+                                 description="Minimal-data split-tunnel VPN "
+                                             "client for Roblox (AmneziaWG).")
+    ap.add_argument("--mock", action="store_true",
+                    help="dry-run mode: simulate the tunnel, no admin needed")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run built-in logic tests and exit")
+    args = ap.parse_args(argv)
+
+    if args.self_test:
+        sys.exit(run_self_tests())
+
+    if os.name == "nt" and not args.mock and not is_admin():
+        # Re-launch elevated; the elevated copy does the real work.
+        relaunch_elevated([a for a in sys.argv[1:]])
+        return
+
+    app = VpnApp(mock=args.mock)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,37 @@
+name: build-exe
+
+# Builds the real Windows .exe with PyInstaller and smoke-tests it:
+#   dist/RobloxVPN.exe  - tray VPN client (no console, no Python needed)
+
+on:
+  push:
+    paths:
+      - 'client/**'
+      - '.github/workflows/build-exe.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build deps
+        run: pip install pyinstaller -r client/requirements.txt
+
+      - name: Build exe
+        run: pyinstaller --noconfirm --onefile --noconsole --name RobloxVPN client/roblox_vpn.py
+
+      - name: Smoke-test exe (built-in self-test, no admin needed)
+        run: dist\RobloxVPN.exe --self-test
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/RobloxVPN.exe
