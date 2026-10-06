@@ -821,17 +821,16 @@ class VpnApp:
         from pystray import Menu, MenuItem
         with self._lock:
             connected = self.connected
-            sess = "Session  down %s / up %s" % (fmt_bytes(self.sess_rx),
-                                                 fmt_bytes(self.sess_tx))
-            tot = "Total  down %s / up %s" % (fmt_bytes(self.totals["rx"]),
-                                              fmt_bytes(self.totals["tx"]))
             status = self.status_msg
-            mode = "mock" if self.mock else "amneziawg"
+        if connected:
+            short = "Connected"
+        elif any(k in status.lower() for k in ("download", "install",
+                                               "connecting", "starting")):
+            short = status
+        else:
+            short = "Disconnected"
         items = [
-            MenuItem(status, None, enabled=False),
-            MenuItem(sess, None, enabled=False),
-            MenuItem(tot, None, enabled=False),
-            MenuItem("mode: %s" % mode, None, enabled=False),
+            MenuItem(short, None, enabled=False),
             MenuItem("---", None, enabled=False),
         ]
         if connected:
@@ -945,6 +944,10 @@ def _v(app):
 
 
 def _open_dashboard(app):
+    """Main window: dark, glanceable status + big connect button.
+
+    Pure-black theme, live data cards, one-tap import/guide actions.
+    """
     import tkinter as tk
     from tkinter import messagebox
     if app.dash_win is not None:
@@ -958,47 +961,82 @@ def _open_dashboard(app):
     app.dash_win = win
     win.title("RobloxVPN")
     win.resizable(False, False)
-    win.configure(bg="#111111")
-    fg, dim, acc = "#f2f2f2", "#9a9a9a", "#2ea043"
 
-    def row(r, label):
-        tk.Label(win, text=label, fg=dim, bg="#111111",
-                 font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w",
-                                            padx=14, pady=3)
-        v = tk.Label(win, text="—", fg=fg, bg="#111111", font=("Segoe UI", 9,
-                                                               "bold"))
-        v.grid(row=r, column=1, sticky="w", padx=14, pady=3)
-        return v
+    BG, CARD, FG, DIM = "#000000", "#141414", "#f5f5f5", "#8a8a8a"
+    GREEN, RED, AMBER = "#2ea043", "#f85149", "#d29922"
+    FONT = "Segoe UI"
+    win.configure(bg=BG)
 
-    vals = {}
-    vals["status"] = row(0, "Status")
-    vals["endpoint"] = row(1, "Server")
-    vals["mode"] = row(2, "Backend")
-    vals["sess"] = row(3, "This session")
-    vals["tot"] = row(4, "Total used")
-    note = tk.Label(win, text="Split tunnel: only Roblox traffic uses the VPN.",
-                    fg=dim, bg="#111111", font=("Segoe UI", 8))
-    note.grid(row=5, column=0, columnspan=2, padx=14, pady=(6, 2))
+    # -- header ------------------------------------------------------
+    header = tk.Frame(win, bg=BG)
+    header.pack(fill="x", padx=20, pady=(18, 2))
+    tk.Label(header, text="ROBLOXVPN", fg=FG, bg=BG,
+             font=(FONT, 13, "bold")).pack(side="left")
+    pill = tk.Label(header, text="", fg=DIM, bg=BG, font=(FONT, 9, "bold"))
+    pill.pack(side="right")
 
-    btn_frame = tk.Frame(win, bg="#111111")
-    btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
-    conn_btn = tk.Button(btn_frame, text="Connect", width=12, bg=acc,
-                         fg="white", font=("Segoe UI", 9, "bold"),
+    # -- status hero -------------------------------------------------
+    hero = tk.Frame(win, bg=BG)
+    hero.pack(fill="x", pady=(8, 2))
+    dot = tk.Label(hero, text="\u25cf", fg=DIM, bg=BG, font=(FONT, 40))
+    dot.pack()
+    title = tk.Label(hero, text="Disconnected", fg=FG, bg=BG,
+                     font=(FONT, 17, "bold"))
+    title.pack()
+    sub = tk.Label(hero, text="", fg=DIM, bg=BG, font=(FONT, 9))
+    sub.pack(pady=(2, 0))
+
+    # -- main action -------------------------------------------------
+    main_btn = tk.Button(win, text="Connect", fg="white", bg=GREEN,
+                         activeforeground="white", activebackground="#3fb950",
+                         font=(FONT, 11, "bold"), bd=0, relief="flat",
+                         highlightthickness=0, padx=20, pady=10,
                          command=lambda: (app.do_disconnect()
                                           if _v(app)["connected"]
                                           else app.do_connect()))
-    conn_btn.pack(side="left", padx=6)
+    main_btn.pack(fill="x", padx=20, pady=(10, 2))
 
-    def reset_totals():
-        if messagebox.askyesno("Reset counters",
-                               "Reset the lifetime data counters?"):
-            with app._lock:
-                app.totals = {"rx": 0, "tx": 0}
-                save_stats(0, 0)
-    tk.Button(btn_frame, text="Reset counters", width=12,
-              command=reset_totals).pack(side="left", padx=6)
+    # -- data cards --------------------------------------------------
+    cards = tk.Frame(win, bg=BG)
+    cards.pack(fill="x", padx=20, pady=(8, 2))
+    cards.columnconfigure(0, weight=1)
+    cards.columnconfigure(1, weight=1)
+
+    def _card(col, heading):
+        c = tk.Frame(cards, bg=CARD, padx=12, pady=10)
+        c.grid(row=0, column=col, sticky="ew",
+               padx=(0, 5) if col == 0 else (5, 0))
+        tk.Label(c, text=heading, fg=DIM, bg=CARD,
+                 font=(FONT, 8, "bold")).pack(anchor="w")
+        down = tk.Label(c, text="\u2193  \u2014", fg=FG, bg=CARD,
+                        font=(FONT, 12, "bold"))
+        down.pack(anchor="w", pady=(6, 0))
+        up = tk.Label(c, text="\u2191  \u2014", fg=FG, bg=CARD,
+                      font=(FONT, 12, "bold"))
+        up.pack(anchor="w")
+        return down, up
+
+    sess_down, sess_up = _card(0, "THIS SESSION")
+    tot_down, tot_up = _card(1, "TOTAL")
+
+    # -- footnote + secondary actions --------------------------------
+    tk.Label(win, text="Split tunnel \u00b7 only Roblox traffic uses the VPN.",
+             fg=DIM, bg=BG, font=(FONT, 8)).pack(pady=(8, 6))
+    row = tk.Frame(win, bg=BG)
+    row.pack()
+    for text, cmd in (("Import config", app.import_dialog),
+                      ("Setup guide", app.open_guide)):
+        tk.Button(row, text=text, fg=FG, bg=CARD, activeforeground=FG,
+                  activebackground="#222222", font=(FONT, 9), bd=0,
+                  relief="flat", highlightthickness=0, padx=14, pady=7,
+                  command=cmd).pack(side="left", padx=5)
+    reset = tk.Label(win, text="reset counters", fg=DIM, bg=BG, cursor="hand2",
+                     font=(FONT, 8, "underline"))
+    reset.pack(pady=(8, 2))
+    reset.bind("<Button-1>", lambda e: _reset_counters())
 
     adv = tk.BooleanVar(value=bool(app.settings.get("allow_full_tunnel")))
+
     def _toggle_adv():
         app.settings["allow_full_tunnel"] = bool(adv.get())
         save_settings(app.settings)
@@ -1007,11 +1045,19 @@ def _open_dashboard(app):
                 "Full tunnel allowed",
                 "Full-tunnel configs (0.0.0.0/0) will now import. This routes "
                 "ALL traffic through the VPN and burns metered data fast.")
+
     tk.Checkbutton(win, text="Allow full-tunnel configs (not recommended)",
-                   variable=adv, command=_toggle_adv, fg=dim, bg="#111111",
-                   selectcolor="#111111", activebackground="#111111",
-                   font=("Segoe UI", 8)).grid(row=7, column=0, columnspan=2,
-                                              padx=14, pady=(0, 10))
+                   variable=adv, command=_toggle_adv, fg=DIM, bg=BG,
+                   selectcolor=BG, activebackground=BG, activeforeground=DIM,
+                   highlightthickness=0,
+                   font=(FONT, 8)).pack(pady=(0, 12))
+
+    def _reset_counters():
+        if messagebox.askyesno("Reset counters",
+                               "Reset the lifetime data counters?"):
+            with app._lock:
+                app.totals = {"rx": 0, "tx": 0}
+                save_stats(0, 0)
 
     def refresh():
         try:
@@ -1020,23 +1066,48 @@ def _open_dashboard(app):
         except Exception:  # noqa: BLE001
             return
         s = _v(app)
-        vals["status"].config(text=s["status"],
-                              fg=acc if s["connected"] else fg)
-        vals["endpoint"].config(text=s["endpoint"])
-        vals["mode"].config(text=s["mode"] +
-                            ("" if s["backend_ok"] or app.mock
-                             else " - MISSING"))
-        vals["sess"].config(text="down %s / up %s" % (fmt_bytes(s["sess"][0]),
-                                                      fmt_bytes(s["sess"][1])))
-        vals["tot"].config(text="down %s / up %s" % (fmt_bytes(s["tot"][0]),
-                                                    fmt_bytes(s["tot"][1])))
-        conn_btn.config(text="Disconnect" if s["connected"] else "Connect")
+        st = s["status"]
+        if s["connected"]:
+            color = GREEN
+            title.config(text="Connected")
+            pill.config(text="\u25cf CONNECTED", fg=GREEN)
+            sub_text = "Server " + s["endpoint"]
+            if "no handshake" in st or "(?)" in st:
+                sub_text += "  \u00b7  waiting for handshake\u2026"
+            sub.config(text=sub_text)
+            main_btn.config(text="Disconnect", bg=RED,
+                            activebackground="#ff7b72")
+        elif any(k in st.lower()
+                 for k in ("download", "install", "connecting")):
+            color = AMBER
+            title.config(text="Working\u2026")
+            pill.config(text="\u25cf WORKING", fg=AMBER)
+            sub.config(text=st)
+            main_btn.config(text="Connect", bg=GREEN,
+                            activebackground="#3fb950")
+        else:
+            color = DIM
+            title.config(text="Disconnected")
+            pill.config(text="\u25cb OFFLINE", fg=DIM)
+            sub.config(text="Import a config, then Connect."
+                       if s["endpoint"] == "?" else "Server " + s["endpoint"])
+            main_btn.config(text="Connect", bg=GREEN,
+                            activebackground="#3fb950")
+        dot.config(fg=color)
+        sess_down.config(text="\u2193  " + fmt_bytes(s["sess"][0]))
+        sess_up.config(text="\u2191  " + fmt_bytes(s["sess"][1]))
+        tot_down.config(text="\u2193  " + fmt_bytes(s["tot"][0]))
+        tot_up.config(text="\u2191  " + fmt_bytes(s["tot"][1]))
         app.root.after(1500, refresh)
 
     def on_close():
         app.dash_win = None
         win.destroy()
+
     win.protocol("WM_DELETE_WINDOW", on_close)
+    win.update_idletasks()
+    win.geometry("+%d+%d" % ((win.winfo_screenwidth() - win.winfo_width()) // 2,
+                             win.winfo_screenheight() // 4))
     refresh()
 
 
