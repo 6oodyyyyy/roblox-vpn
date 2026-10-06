@@ -371,16 +371,59 @@ def download_awg_installer(progress_cb=None, timeout=30):
     return dest
 
 
-def install_awg_msi(msi_path):
-    """Silently install the AmneziaWG MSI. Requires admin (app self-elevates)."""
+def _msi_log_path():
+    return os.path.join(tempfile.gettempdir(), "awg-install.log")
+
+
+def _msi_failure_hint(log_path):
+    """Extract the most useful error context from a verbose MSI log.
+
+    MSI marks a failing custom action with "Return value 3" -- grab the
+    lines around it. Pure -- covered by --self-test.
+    """
     try:
-        p = subprocess.run(["msiexec", "/i", msi_path, "/qn", "/norestart"],
-                           capture_output=True, text=True, timeout=180)
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    for i, ln in enumerate(lines):
+        if "Return value 3" in ln:
+            ctx = "".join(lines[max(0, i - 6):i + 1]).strip()
+            if len(ctx) > 700:
+                ctx = ctx[-700:]
+            return " (failing step):\n" + ctx
+    errs = [ln.strip()[:180] for ln in lines if "error" in ln.lower()][-3:]
+    return (":\n" + "\n".join(errs)) if errs else ""
+
+
+def _clear_awg_msi_cache():
+    tmp = tempfile.gettempdir()
+    try:
+        for name in os.listdir(tmp):
+            if name.startswith("amneziawg-") and name.endswith(".msi"):
+                os.unlink(os.path.join(tmp, name))
+    except OSError:
+        pass
+
+
+def install_awg_msi(msi_path):
+    """Silently install the AmneziaWG MSI. Requires admin (app self-elevates).
+
+    Writes a verbose log to %TEMP%\\awg-install.log so a 1603-style generic
+    failure can be diagnosed with the real error.
+    """
+    log_path = _msi_log_path()
+    try:
+        p = subprocess.run(
+            ["msiexec", "/i", msi_path, "/qn", "/norestart",
+             "/l*v", log_path],
+            capture_output=True, text=True, timeout=300)
     except Exception as e:  # noqa: BLE001
         raise TunnelError("installer failed to run: %s" % e)
     # 0 = ok, 3010 = ok, reboot needed (tunnel works without it)
     if p.returncode not in (0, 3010):
-        raise TunnelError("installer exited with code %d" % p.returncode)
+        raise TunnelError("installer exited with code %d%s"
+                          % (p.returncode, _msi_failure_hint(log_path)))
 
 
 class AmneziaWGBackend:
@@ -622,6 +665,12 @@ class VpnApp:
                                    % fmt_bytes(done))
 
         try:
+            if not is_admin():
+                raise TunnelError(
+                    "not running as administrator -- the installer needs "
+                    "it. Close the app, right-click RobloxVPN.exe -> "
+                    "'Run as administrator' (or accept the UAC prompt on "
+                    "launch), then try again.")
             msi = download_awg_installer(progress_cb=_progress)
             self.status_msg = "Installing AmneziaWG client..."
             install_awg_msi(msi)
@@ -638,7 +687,11 @@ class VpnApp:
             self.status_msg = "AmneziaWG client missing"
             self._notify("Install failed",
                          "The VPN engine could not be installed automatically. "
-                         "Open the dashboard for the manual link.")
+                         "A fix-it window is opening.")
+            if self.root:
+                self._install_failed_shown = True
+                self.root.after(
+                    0, lambda: _install_failed_dialog(self, str(e)))
             return
         ok, msg = self.backend.available()
         self.backend_ok = ok
@@ -649,6 +702,15 @@ class VpnApp:
                          "The VPN engine is ready. Import a .conf to connect.")
         else:
             self.status_msg = "AmneziaWG client missing"
+
+    def retry_install(self):
+        """Re-run the AmneziaWG auto-install with a fresh download."""
+        _clear_awg_msi_cache()
+        self._install_failed_shown = False
+        self.status_msg = "Retrying AmneziaWG install..."
+        self._install_thread = threading.Thread(
+            target=self._auto_install_backend, daemon=True)
+        self._install_thread.start()
 
     # -- connection control -------------------------------------------
     def do_connect(self):
@@ -820,6 +882,9 @@ class VpnApp:
                 if t is not None:
                     t.join(timeout=180)
                 if not self.backend_ok and self.root:
+                    # Skip: the rich fix-it dialog was already shown.
+                    if getattr(self, "_install_failed_shown", False):
+                        return
                     self.root.after(0, lambda: messagebox.showwarning(
                         "AmneziaWG client not found",
                         self.backend_msg + "\n\nThe tray icon is running; "
@@ -958,6 +1023,46 @@ def _open_dashboard(app):
         win.destroy()
     win.protocol("WM_DELETE_WINDOW", on_close)
     refresh()
+
+
+def _install_failed_dialog(app, detail):
+    """Fix-it window shown when the AmneziaWG auto-install fails.
+
+    Shows the real installer error (parsed from the MSI log), a Retry
+    button (fresh download), and a clickable manual-download link --
+    no dead-end message boxes.
+    """
+    import tkinter as tk
+    import webbrowser
+    win = tk.Toplevel(app.root)
+    win.title("AmneziaWG install failed")
+    win.resizable(False, False)
+    tk.Label(win, text="The VPN engine could not be installed automatically.",
+             font=("TkDefaultFont", 10, "bold")).pack(
+                 anchor="w", padx=14, pady=(12, 4))
+    short = detail if len(detail) <= 500 else detail[:500] + "..."
+    tk.Message(win, text=short, width=440).pack(anchor="w", padx=14)
+    tk.Label(win, text="What to try:",
+             font=("TkDefaultFont", 9, "bold")).pack(
+                 anchor="w", padx=14, pady=(8, 2))
+    tk.Label(win, justify="left", wraplength=440, text=(
+        "1. Make sure you accepted the admin (UAC) prompt when starting "
+        "RobloxVPN.\n"
+        "2. If Windows just updated, restart the PC, then press Retry.\n"
+        "3. Or install it manually from the releases page.")).pack(
+            anchor="w", padx=14)
+    row = tk.Frame(win)
+    row.pack(pady=12)
+    tk.Button(row, text="Retry install",
+              command=lambda: (win.destroy(), app.retry_install())).pack(
+                  side="left", padx=6)
+    tk.Button(row, text="Open download page",
+              command=lambda: webbrowser.open(
+                  "https://github.com/amnezia-vpn/"
+                  "amneziawg-windows-client/releases")).pack(
+                      side="left", padx=6)
+    tk.Button(row, text="Close", command=win.destroy).pack(side="left",
+                                                           padx=6)
 
 
 def _open_guide(app):
@@ -1285,6 +1390,21 @@ def run_self_tests():
     check("guide links https",
           len(GUIDE_LINKS) >= 2
           and all(v.startswith("https://") for v in GUIDE_LINKS.values()))
+
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+        f.write("MSI (s) ...\nAction start InstallDriver\n"
+                "InstallDriver: Error 1721 configuring\n"
+                "Action ended with Return value 3.\n"
+                "MSI (s): note after\n")
+        fake_log = f.name
+    try:
+        hint = _msi_failure_hint(fake_log)
+        check("msi hint finds Return value 3",
+              "Return value 3" in hint and "InstallDriver" in hint, hint[:120])
+    finally:
+        os.unlink(fake_log)
+    check("msi hint missing log", _msi_failure_hint("/nonexistent/x.log") == "")
 
     # MockBackend cycle (uses a temp conf file)
     import tempfile
