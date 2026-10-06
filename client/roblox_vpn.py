@@ -36,6 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
+APP_VERSION = "v9"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -959,7 +960,7 @@ def _open_dashboard(app):
             app.dash_win = None
     win = tk.Toplevel(app.root)
     app.dash_win = win
-    win.title("RobloxVPN")
+    win.title("RobloxVPN %s" % APP_VERSION)
     win.resizable(False, False)
 
     BG, CARD, FG, DIM = "#000000", "#141414", "#f5f5f5", "#8a8a8a"
@@ -1034,6 +1035,8 @@ def _open_dashboard(app):
                      font=(FONT, 8, "underline"))
     reset.pack(pady=(8, 2))
     reset.bind("<Button-1>", lambda e: _reset_counters())
+    tk.Label(win, text=APP_VERSION, fg="#3a3a3a", bg=BG,
+             font=(FONT, 8)).pack(pady=(0, 8))
 
     adv = tk.BooleanVar(value=bool(app.settings.get("allow_full_tunnel")))
 
@@ -1390,6 +1393,8 @@ def run_self_tests():
             fails.append(name)
 
     check("fmt_bytes B", fmt_bytes(0) == "0 B")
+    check("app version format",
+          bool(re.match(r"^v\d+$", APP_VERSION)), APP_VERSION)
     check("fmt_bytes KB", fmt_bytes(1536) == "1.5 KB")
     check("fmt_bytes MB", fmt_bytes(5 * 1024 ** 2) == "5.0 MB")
     check("transfer KiB", parse_transfer_amount("6.55", "KiB") == 6707)
@@ -1539,6 +1544,34 @@ def run_self_tests():
 # Entry point
 # ---------------------------------------------------------------------------
 
+_single_instance_mutex = None
+
+
+def ensure_single_instance():
+    """Windows: refuse to run when another copy is already up.
+
+    Prevents the classic upgrade confusion where the old exe keeps running
+    in the tray while the user launches the new one (two identical icons).
+    Returns True if this instance may continue.
+    """
+    global _single_instance_mutex
+    if os.name != "nt":
+        return True
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    _single_instance_mutex = kernel32.CreateMutexW(
+        None, False, "RobloxVPN_SingleInstance_Mutex")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "RobloxVPN is already running.\n\n"
+            "Right-click its tray icon (near the clock) and choose Exit,\n"
+            "then run this file again.",
+            APP_NAME, 0x40)
+        return False
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog=APP_NAME,
                                  description="Minimal-data split-tunnel VPN "
@@ -1555,6 +1588,9 @@ def main(argv=None):
     if os.name == "nt" and not args.mock and not is_admin():
         # Re-launch elevated; the elevated copy does the real work.
         relaunch_elevated([a for a in sys.argv[1:]])
+        return
+
+    if not ensure_single_instance():
         return
 
     app = VpnApp(mock=args.mock)
