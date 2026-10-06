@@ -277,12 +277,27 @@ class TunnelError(Exception):
 def _run(cmd, timeout=30):
     """Run a command, return (ok, stdout+stderr). Never raises."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, **_no_window())
         return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
     except FileNotFoundError:
         return False, "not found: %s" % cmd[0]
     except Exception as e:  # noqa: BLE001
         return False, str(e)
+
+
+def _no_window():
+    """subprocess kwargs that prevent console-window flashing on Windows.
+
+    The exe is built --noconsole, but every child process (awg show every
+    2s, sc, msiexec) would otherwise pop a visible cmd window.
+    """
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return {"startupinfo": si,
+            "creationflags": subprocess.CREATE_NO_WINDOW}
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +432,7 @@ def install_awg_msi(msi_path):
         p = subprocess.run(
             ["msiexec", "/i", msi_path, "/qn", "/norestart",
              "/l*v", log_path],
-            capture_output=True, text=True, timeout=300)
+            capture_output=True, text=True, timeout=300, **_no_window())
     except Exception as e:  # noqa: BLE001
         raise TunnelError("installer failed to run: %s" % e)
     # 0 = ok, 3010 = ok, reboot needed (tunnel works without it)
@@ -1405,6 +1420,11 @@ def run_self_tests():
     finally:
         os.unlink(fake_log)
     check("msi hint missing log", _msi_failure_hint("/nonexistent/x.log") == "")
+    if os.name != "nt":
+        check("no_window empty off-windows", _no_window() == {})
+    else:
+        check("no_window hides console on windows",
+              "creationflags" in _no_window())
 
     # MockBackend cycle (uses a temp conf file)
     import tempfile
