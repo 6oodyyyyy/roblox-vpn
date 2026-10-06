@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v12"
+APP_VERSION = "v13"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -217,10 +217,12 @@ def _split_allowed_ips(text):
 def convert_to_split_tunnel(text):
     """Rewrite a full-tunnel .conf into a Roblox-only split-tunnel .conf.
 
-    Keeps Interface keys, Peer endpoint/keys, DNS, comments -- only the
-    [Peer] AllowedIPs lines are replaced with ROBLOX_ALLOWED_IPS. This is
-    what makes third-party configs (e.g. ProtonVPN free, which ships
-    0.0.0.0/0) usable without burning metered data.
+    Keeps Interface keys, Peer endpoint/keys, comments -- the [Peer]
+    AllowedIPs lines are replaced with ROBLOX_ALLOWED_IPS (this is what
+    makes third-party configs, e.g. ProtonVPN free which ships 0.0.0.0/0,
+    usable without burning metered data), and a provider-internal DNS
+    (e.g. ProtonVPN's 10.2.0.1, unreachable outside their full tunnel) is
+    replaced with public resolvers so name resolution keeps working.
     Pure -- covered by --self-test.
     """
     def _repl_peer(m):
@@ -230,8 +232,47 @@ def convert_to_split_tunnel(text):
                           body, flags=re.MULTILINE | re.IGNORECASE)
         return "[Peer]" + new_body
 
-    return re.sub(r"^\[Peer\](.*?)(?=^\[|\Z)", _repl_peer, text,
+    text = re.sub(r"^\[Peer\](.*?)(?=^\[|\Z)", _repl_peer, text,
                   flags=re.MULTILINE | re.DOTALL)
+    return _fix_dns_for_split_tunnel(text)
+
+
+def _is_private_ip(ip):
+    """True for RFC1918 / loopback addresses (unreachable via split tunnel)."""
+    ip = ip.strip().lower()
+    if ip.startswith(("10.", "192.168.", "127.", "::1")):
+        return True
+    if ip.startswith("172."):
+        try:
+            return 16 <= int(ip.split(".")[1]) <= 31
+        except (IndexError, ValueError):
+            return False
+    return ip.startswith("fc00:") or ip.startswith("fd00:")
+
+
+def _fix_dns_for_split_tunnel(text):
+    """Replace provider-internal DNS with public resolvers.
+
+    Provider configs (e.g. ProtonVPN) ship DNS = 10.x.x.x which is only
+    reachable through their full tunnel. In our split tunnel that address
+    is a blackhole: Windows sends name queries there, they die, and it
+    feels like "the internet disconnected". Public resolvers go direct
+    and work with or without the tunnel. Pure -- covered by --self-test.
+    """
+    def _repl_iface(m):
+        body = m.group(1)
+        dm = re.search(r"^DNS\s*=\s*(.+)$", body,
+                       re.MULTILINE | re.IGNORECASE)
+        if not dm:
+            return m.group(0)
+        vals = [v.strip() for v in dm.group(1).split(",")]
+        if any(_is_private_ip(v) for v in vals):
+            body = re.sub(r"^DNS\s*=.*$", "DNS = 1.1.1.1, 8.8.8.8",
+                          body, flags=re.MULTILINE | re.IGNORECASE)
+        return "[Interface]" + body
+
+    return re.sub(r"^\[Interface\](.*?)(?=^\[|\Z)", _repl_iface, text,
+                  flags=re.MULTILINE | re.DOTALL | re.IGNORECASE)
 
 
 AWG_OBF_KEYS = ("Jc", "Jmin", "Jmax",
@@ -1304,7 +1345,8 @@ def _import_dialog(app):
     ok, errors, warnings = validate_config_text(text, allow_full_tunnel=allow)
     if not ok:
         # One-click rescue: a full-tunnel config (e.g. ProtonVPN free) can be
-        # converted to Roblox-only split-tunnel, keeping keys/endpoint/DNS.
+        # converted to Roblox-only split-tunnel, keeping keys/endpoint
+        # (and fixing provider-internal DNS to public resolvers).
         only_full = errors and all("FULL-TUNNEL" in e for e in errors)
         if only_full and messagebox.askyesno(
                 "Full-tunnel config detected",
@@ -1564,6 +1606,24 @@ def run_self_tests():
           and "AllowedIPs = 128.116.0.0/17" in stripped)
     ok, errs, _ = validate_config_text(stripped)
     check("stripped validates clean", ok, "; ".join(errs))
+    check("_is_private_ip 10.x", _is_private_ip("10.2.0.1"))
+    check("_is_private_ip 192.168.x", _is_private_ip("192.168.1.1"))
+    check("_is_private_ip 172.16-31", _is_private_ip("172.20.0.5")
+          and not _is_private_ip("172.15.0.5"))
+    check("_is_private_ip public",
+          not _is_private_ip("1.1.1.1") and not _is_private_ip("8.8.8.8"))
+    dns_cfg = ("[Interface]\nPrivateKey = AAA=\nDNS = 10.2.0.1\n"
+               "[Peer]\nPublicKey = BBB=\nEndpoint = 203.0.113.7:443\n"
+               "AllowedIPs = 0.0.0.0/0\n")
+    conv2 = convert_to_split_tunnel(dns_cfg)
+    check("convert fixes private DNS", "DNS = 1.1.1.1, 8.8.8.8" in conv2,
+          conv2[:200])
+    pub_cfg = dns_cfg.replace("DNS = 10.2.0.1", "DNS = 1.1.1.1")
+    check("convert keeps public DNS",
+          "DNS = 1.1.1.1" in convert_to_split_tunnel(pub_cfg))
+    nodns_cfg = dns_cfg.replace("DNS = 10.2.0.1\n", "")
+    check("convert no DNS line ok",
+          "DNS" not in convert_to_split_tunnel(nodns_cfg))
     # connect() must reinstall the tunnel service from scratch, so a stale
     # service left by a killed/older instance can never survive with an old
     # config (this was the "Tunnel already installed and running" failure).
