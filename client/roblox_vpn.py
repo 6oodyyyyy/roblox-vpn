@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v13"
+APP_VERSION = "v14"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -305,8 +305,19 @@ def validate_config_text(text, allow_full_tunnel=False):
         errors.append("missing [Interface] section")
     if "[Peer]" not in text:
         errors.append("missing [Peer] section")
-    if not re.search(r"^PrivateKey\s*=\s*\S+", text, re.MULTILINE):
+    pm = re.search(r"^PrivateKey\s*=\s*(\S+)", text, re.MULTILINE)
+    if not pm:
         errors.append("missing PrivateKey in [Interface]")
+    elif not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pm.group(1)):
+        # ProtonVPN's site masks the private key with asterisks unless you
+        # download immediately after creating the config -- a masked key
+        # parses fine but the server silently ignores every handshake.
+        errors.append(
+            "PrivateKey is not a valid WireGuard key (got %r). The site "
+            "masks it with asterisks unless you download IMMEDIATELY after "
+            "creating the config -- re-create it on Proton's site and "
+            "download right away, then import the fresh file." %
+            (pm.group(1)[:12] + "..."))
     if not re.search(r"^PublicKey\s*=\s*\S+", text, re.MULTILINE):
         errors.append("missing PublicKey in [Peer]")
     if not re.search(r"^Endpoint\s*=\s*\S+:\d+", text, re.MULTILINE):
@@ -1557,8 +1568,8 @@ def run_self_tests():
                            "browser_download_url": "x", "size": 1}],
                          "AMD64") is None)
 
-    cfg = generate_config("203.0.113.7", 443, "SERVERPUBKEY==",
-                          "CLIENTPRIVKEY==", obf=o)
+    cfg = generate_config("203.0.113.7", 443, "c2VydmVycHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWo=",
+                          "dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVmZ2g=", obf=o)
     check("gen has Interface", "[Interface]" in cfg)
     check("gen MTU", "MTU = 1420" in cfg)
     check("gen endpoint port", "Endpoint = 203.0.113.7:443" in cfg)
@@ -1583,17 +1594,17 @@ def run_self_tests():
     check("convert adds roblox range", "128.116.0.0/17" in conv)
     check("convert keeps endpoint", "Endpoint = 203.0.113.7:443" in conv)
     check("convert keeps keys",
-          "PrivateKey = CLIENTPRIVKEY==" in conv
-          and "PublicKey = SERVERPUBKEY==" in conv)
+          "PrivateKey = dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVmZ2g=" in conv
+          and "PublicKey = c2VydmVycHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWo=" in conv)
     ok, errs, _ = validate_config_text(conv)
     check("convert validates clean", ok, "; ".join(errs))
-    obf_cfg = ("[Interface]\nPrivateKey = CLIENTPRIVKEY==\n"
+    obf_cfg = ("[Interface]\nPrivateKey = dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVmZ2g=\n"
                "Jc = 4\nJmin = 10\nJmax = 60\nS1 = 30\nH1 = 12345\n"
-               "[Peer]\nPublicKey = SERVERPUBKEY==\n"
+               "[Peer]\nPublicKey = c2VydmVycHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWo=\n"
                "Endpoint = 203.0.113.7:443\nAllowedIPs = 128.116.0.0/17\n")
     check("has_obfuscation detects", has_obfuscation(obf_cfg))
-    plain_cfg = ("[Interface]\nPrivateKey = CLIENTPRIVKEY==\n"
-                 "[Peer]\nPublicKey = SERVERPUBKEY==\n"
+    plain_cfg = ("[Interface]\nPrivateKey = dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVmZ2g=\n"
+                 "[Peer]\nPublicKey = c2VydmVycHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWo=\n"
                  "Endpoint = 203.0.113.7:443\nAllowedIPs = 128.116.0.0/17\n")
     check("has_obfuscation clean", not has_obfuscation(plain_cfg))
     stripped = strip_obfuscation(obf_cfg)
@@ -1601,7 +1612,7 @@ def run_self_tests():
           not has_obfuscation(stripped)
           and "Jc" not in stripped and "S1" not in stripped)
     check("strip keeps keys/endpoint",
-          "PrivateKey = CLIENTPRIVKEY==" in stripped
+          "PrivateKey = dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVmZ2g=" in stripped
           and "Endpoint = 203.0.113.7:443" in stripped
           and "AllowedIPs = 128.116.0.0/17" in stripped)
     ok, errs, _ = validate_config_text(stripped)
@@ -1624,6 +1635,14 @@ def run_self_tests():
     nodns_cfg = dns_cfg.replace("DNS = 10.2.0.1\n", "")
     check("convert no DNS line ok",
           "DNS" not in convert_to_split_tunnel(nodns_cfg))
+    badkey = plain_cfg.replace("PrivateKey = dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVmZ2g=",
+                               "PrivateKey = ****************")
+    ok, errs, _ = validate_config_text(badkey)
+    check("reject masked private key",
+          not ok and any("PrivateKey is not a valid" in e for e in errs),
+          "; ".join(errs))
+    ok, errs, _ = validate_config_text(plain_cfg)
+    check("accept valid private key", ok, "; ".join(errs))
     # connect() must reinstall the tunnel service from scratch, so a stale
     # service left by a killed/older instance can never survive with an old
     # config (this was the "Tunnel already installed and running" failure).
