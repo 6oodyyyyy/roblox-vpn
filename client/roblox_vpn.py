@@ -1271,6 +1271,11 @@ def _generate_dialog(app):
     win = tk.Toplevel(app.root)
     win.title("Generate RobloxVPN config")
     win.resizable(False, False)
+    tk.Label(win, text="For your OWN AmneziaWG server only (e.g. the Oracle VM).\n"
+                       "NOT for ProtonVPN -- import their .conf instead.",
+             fg="#d29922", justify="left",
+             font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=2,
+                                                sticky="w", padx=10, pady=(10, 2))
     fields = {}
     def row(r, label, default="", width=44):
         tk.Label(win, text=label).grid(row=r, column=0, sticky="w",
@@ -1280,16 +1285,16 @@ def _generate_dialog(app):
         e.grid(row=r, column=1, padx=10, pady=3)
         fields[label] = e
         return e
-    row(0, "Server IP / hostname", "")
-    row(1, "Port (UDP)", str(DEFAULT_PORT))
-    row(2, "Server public key", "")
-    row(3, "Client private key", generate_private_key())
-    row(4, "Preshared key (optional)", "")
-    row(5, "AllowedIPs", ", ".join(ROBLOX_ALLOWED_IPS))
+    row(1, "Server IP / hostname", "")
+    row(2, "Port (UDP)", str(DEFAULT_PORT))
+    row(3, "Server public key", "")
+    row(4, "Client private key", generate_private_key())
+    row(5, "Preshared key (optional)", "")
+    row(6, "AllowedIPs", ", ".join(ROBLOX_ALLOWED_IPS))
     obf = [random_obfuscation()]
     obf_lbl = tk.Label(win, text="", fg="#555555", font=("Segoe UI", 8),
                        wraplength=380, justify="left")
-    obf_lbl.grid(row=6, column=0, columnspan=2, padx=10, pady=3)
+    obf_lbl.grid(row=7, column=0, columnspan=2, padx=10, pady=3)
     def show_obf():
         o = obf[0]
         obf_lbl.config(text="Obfuscation: Jc=%d Jmin=%d Jmax=%d S=%d,%d,%d,%d "
@@ -1298,7 +1303,7 @@ def _generate_dialog(app):
                                 o["S2"], o["S3"], o["S4"]))
     show_obf()
     btns = tk.Frame(win)
-    btns.grid(row=7, column=0, columnspan=2, pady=8)
+    btns.grid(row=8, column=0, columnspan=2, pady=8)
     tk.Button(btns, text="New client key",
               command=lambda: (fields["Client private key"].delete(0, "end"),
                                fields["Client private key"].insert(
@@ -1308,7 +1313,7 @@ def _generate_dialog(app):
               command=lambda: (obf.__setitem__(0, random_obfuscation()),
                                show_obf())).pack(side="left", padx=4)
     tk.Label(win, text="These values MUST match the server config.",
-             fg="#a00", font=("Segoe UI", 8)).grid(row=8, column=0,
+             fg="#a00", font=("Segoe UI", 8)).grid(row=9, column=0,
                                                   columnspan=2, pady=(0, 4))
     def save(and_connect):
         host = fields["Server IP / hostname"].get().strip()
