@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v11"
+APP_VERSION = "v12"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -465,6 +465,18 @@ def install_awg_msi(msi_path):
                           % (p.returncode, _msi_failure_hint(log_path)))
 
 
+def _wait_service_stopped(timeout=12):
+    """Wait until the tunnel service is stopped or gone (best effort)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        ok, out = _run(["sc", "query", SERVICE_NAME])
+        low = out.lower()
+        if not ok or "1060" in out or "stopped" in low \
+                or "does not exist" in low:
+            return
+        time.sleep(0.5)
+
+
 class AmneziaWGBackend:
     """Drives the official AmneziaWG Windows client programmatically.
 
@@ -504,8 +516,17 @@ class AmneziaWGBackend:
         return True, ""
 
     def connect(self, conf):
+        # Always reinstall from scratch. A stale service left behind by a
+        # killed or older instance (possibly with an older config) must never
+        # survive: the running tunnel has to match the config file on disk.
+        # (The old code tried to tolerate "already exists", but AmneziaWG
+        # actually reports "already installed and running", so Connect kept
+        # failing instead of reusing the service.)
+        _run(["sc", "stop", SERVICE_NAME])
+        _wait_service_stopped()
+        _run([self.amneziawg, "/uninstalltunnelservice", TUNNEL_NAME])
         ok, out = _run([self.amneziawg, "/installtunnelservice", conf])
-        if not ok and "already exists" not in out.lower():
+        if not ok:
             raise TunnelError("installtunnelservice failed:\n" + out.strip())
         # Never auto-start on boot: this app manages the tunnel explicitly so
         # it can never silently burn metered data.
@@ -1543,6 +1564,47 @@ def run_self_tests():
           and "AllowedIPs = 128.116.0.0/17" in stripped)
     ok, errs, _ = validate_config_text(stripped)
     check("stripped validates clean", ok, "; ".join(errs))
+    # connect() must reinstall the tunnel service from scratch, so a stale
+    # service left by a killed/older instance can never survive with an old
+    # config (this was the "Tunnel already installed and running" failure).
+    calls = []
+    def fake_run(cmd, timeout=30):
+        calls.append(cmd)
+        if cmd[:2] == ["sc", "query"]:
+            return True, "STATE              : 1  STOPPED"
+        return True, ""
+    real_run = globals()["_run"]
+    globals()["_run"] = fake_run
+    try:
+        b = AmneziaWGBackend()
+        b.amneziawg = "amneziawg.exe"
+        b.connect("dummy.conf")
+    finally:
+        globals()["_run"] = real_run
+    seq = [c[1] for c in calls]
+    check("connect reinstalls service",
+          seq == ["stop", "query", "/uninstalltunnelservice",
+                  "/installtunnelservice", "config", "start"],
+          repr(seq))
+    check("connect installs current conf", calls[3][2] == "dummy.conf")
+    def fake_run_fail(cmd, timeout=30):
+        if cmd[:2] == ["sc", "query"]:
+            return True, "STOPPED"
+        if cmd[1] == "/installtunnelservice":
+            return False, "[Error: install blew up]"
+        return True, ""
+    globals()["_run"] = fake_run_fail
+    try:
+        b2 = AmneziaWGBackend()
+        b2.amneziawg = "amneziawg.exe"
+        try:
+            b2.connect("dummy.conf")
+            raised = False
+        except TunnelError:
+            raised = True
+    finally:
+        globals()["_run"] = real_run
+    check("connect raises on install failure", raised)
     ok, errs, _ = validate_config_text("[Interface]\nPrivateKey = x\n")
     check("reject malformed", not ok and len(errs) >= 2, "; ".join(errs))
     ok, _, warns = validate_config_text(
