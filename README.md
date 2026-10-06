@@ -39,9 +39,9 @@ System-tray app (Windows 10/11):
 ### Requirements
 
 1. Windows 10/11, 64-bit.
-2. The official AmneziaWG Windows client installed
-   (https://github.com/amnezia-vpn/amneziawg-windows-client → Releases).
-   The app detects it and tells you if it is missing.
+2. The official AmneziaWG Windows client — **auto-installed**: if it is not
+   found, the app downloads its MSI (~4 MB) from the official GitHub releases
+   page and installs it silently in the background. No manual steps.
 3. Administrator rights on first connect (the app self-elevates via UAC).
    A WireGuard/AmneziaWG server somewhere outside the blocked network
    (see `server/`).

@@ -20,13 +20,16 @@ Usage
 import argparse
 import json
 import os
+import platform
 import random
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -256,6 +259,104 @@ def _run(cmd, timeout=30):
         return False, str(e)
 
 
+# ---------------------------------------------------------------------------
+# AmneziaWG auto-install: if the official Windows client is missing, this app
+# downloads its MSI from the GitHub releases page and installs it silently --
+# zero manual steps for the user. (~4 MB, the only download this app ever
+# makes on its own.)
+# ---------------------------------------------------------------------------
+
+AWG_GITHUB_REPO = "amnezia-vpn/amneziawg-windows-client"
+AWG_RELEASES_API = ("https://api.github.com/repos/" + AWG_GITHUB_REPO +
+                    "/releases/latest")
+
+
+def awg_arch_key(machine=None):
+    """Map platform.machine() to the AmneziaWG release asset arch tag."""
+    m = (machine or platform.machine()).lower()
+    if "arm64" in m or "aarch64" in m:
+        return "arm64"
+    if m in ("x86", "i386", "i686"):
+        return "x86"
+    return "amd64"  # AMD64 / x86_64 default
+
+
+def pick_awg_asset(assets, machine=None):
+    """Pick the right .msi from a GitHub release asset list.
+
+    assets: iterable of dicts with 'name'/'browser_download_url'/'size'.
+    Returns (name, url, size) or None. Pure -- covered by --self-test.
+    """
+    want = "amneziawg-%s-" % awg_arch_key(machine)
+    for a in assets or []:
+        name = a.get("name", "")
+        if name.startswith(want) and name.endswith(".msi"):
+            return name, a.get("browser_download_url"), a.get("size", 0)
+    return None
+
+
+def _github_json(url, timeout=20):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": APP_NAME,
+                      "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def download_awg_installer(progress_cb=None, timeout=30):
+    """Download the AmneziaWG Windows MSI for this machine.
+
+    Returns the local .msi path. Raises TunnelError on any failure.
+    """
+    try:
+        rel = _github_json(AWG_RELEASES_API, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        raise TunnelError("could not reach GitHub releases: %s" % e)
+    picked = pick_awg_asset(rel.get("assets"))
+    if not picked:
+        raise TunnelError("no Windows installer found in the latest "
+                          "AmneziaWG release")
+    name, url, size = picked
+    if not url:
+        raise TunnelError("release asset has no download URL")
+    dest = os.path.join(tempfile.gettempdir(), name)
+    if size and os.path.isfile(dest) and os.path.getsize(dest) == size:
+        return dest  # already fetched earlier
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+        with urllib.request.urlopen(req, timeout=timeout) as r, \
+                open(dest, "wb") as f:
+            total = int(r.headers.get("Content-Length") or size or 0)
+            done = 0
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress_cb:
+                    progress_cb(done, total)
+    except Exception as e:  # noqa: BLE001
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise TunnelError("download failed: %s" % e)
+    return dest
+
+
+def install_awg_msi(msi_path):
+    """Silently install the AmneziaWG MSI. Requires admin (app self-elevates)."""
+    try:
+        p = subprocess.run(["msiexec", "/i", msi_path, "/qn", "/norestart"],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:  # noqa: BLE001
+        raise TunnelError("installer failed to run: %s" % e)
+    # 0 = ok, 3010 = ok, reboot needed (tunnel works without it)
+    if p.returncode not in (0, 3010):
+        raise TunnelError("installer exited with code %d" % p.returncode)
+
+
 class AmneziaWGBackend:
     """Drives the official AmneziaWG Windows client programmatically.
 
@@ -475,7 +576,52 @@ class VpnApp:
         ok, msg = self.backend.available()
         self.backend_ok = ok
         self.backend_msg = msg
+        self._install_thread = None
         if not ok and not mock:
+            # Missing engine: fetch + silently install the official client in
+            # the background -- the user wants zero manual steps.
+            self.status_msg = "AmneziaWG client not found -- downloading..."
+            self._install_thread = threading.Thread(
+                target=self._auto_install_backend, daemon=True)
+            self._install_thread.start()
+
+    def _auto_install_backend(self):
+        def _progress(done, total):
+            if total:
+                self.status_msg = ("Downloading AmneziaWG client... %d%% "
+                                   "(%s)" % (int(done * 100 / total),
+                                             fmt_bytes(total)))
+            else:
+                self.status_msg = ("Downloading AmneziaWG client... %s"
+                                   % fmt_bytes(done))
+
+        try:
+            msi = download_awg_installer(progress_cb=_progress)
+            self.status_msg = "Installing AmneziaWG client..."
+            install_awg_msi(msi)
+            try:
+                os.unlink(msi)
+            except OSError:
+                pass
+        except TunnelError as e:
+            self.backend_msg = (
+                "Could not install the AmneziaWG client automatically:\n%s\n\n"
+                "Install it manually from:\n"
+                "https://github.com/amnezia-vpn/amneziawg-windows-client\n"
+                "(Releases page), then restart this app." % e)
+            self.status_msg = "AmneziaWG client missing"
+            self._notify("Install failed",
+                         "The VPN engine could not be installed automatically. "
+                         "Open the dashboard for the manual link.")
+            return
+        ok, msg = self.backend.available()
+        self.backend_ok = ok
+        self.backend_msg = msg
+        if ok:
+            self.status_msg = "Ready -- import a config to connect"
+            self._notify("AmneziaWG installed",
+                         "The VPN engine is ready. Import a .conf to connect.")
+        else:
             self.status_msg = "AmneziaWG client missing"
 
     # -- connection control -------------------------------------------
@@ -637,11 +783,18 @@ class VpnApp:
         threading.Thread(target=self._poll_loop, daemon=True).start()
         threading.Thread(target=self._run_tray, daemon=True).start()
         if not self.backend_ok and not self.mock:
-            # Give the tray a moment to appear, then explain.
-            self.root.after(1500, lambda: messagebox.showwarning(
-                "AmneziaWG client not found",
-                self.backend_msg + "\n\nThe tray icon is running; install the "
-                "client and restart this app to connect."))
+            # The auto-installer runs in the background; warn only if it
+            # finished without producing a working backend.
+            def _watch_install():
+                t = self._install_thread
+                if t is not None:
+                    t.join(timeout=180)
+                if not self.backend_ok and self.root:
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "AmneziaWG client not found",
+                        self.backend_msg + "\n\nThe tray icon is running; "
+                        "restart this app after installing the client."))
+            threading.Thread(target=_watch_install, daemon=True).start()
         self.root.mainloop()
 
     def quit(self):
@@ -948,6 +1101,31 @@ def run_self_tests():
     check("obf ranges", 3 <= o["Jc"] <= 10 and 15 <= o["S1"] <= 127)
     check("obf H uint32", all(1 <= o[k] <= 2 ** 32 - 1
                               for k in ("H1", "H2", "H3", "H4")))
+
+    check("awg arch amd64", awg_arch_key("AMD64") == "amd64")
+    check("awg arch x86_64", awg_arch_key("x86_64") == "amd64")
+    check("awg arch arm64", awg_arch_key("ARM64") == "arm64")
+    check("awg arch x86", awg_arch_key("x86") == "x86")
+    fake_assets = [
+        {"name": "amneziawg-amd64-3.1.0.msi",
+         "browser_download_url": "https://example.com/a.msi", "size": 3641344},
+        {"name": "amneziawg-arm64-3.1.0.msi",
+         "browser_download_url": "https://example.com/b.msi", "size": 3330048},
+        {"name": "checksums.txt",
+         "browser_download_url": "https://example.com/c", "size": 100},
+    ]
+    picked = pick_awg_asset(fake_assets, "AMD64")
+    check("awg pick amd64",
+          picked is not None and picked[0] == "amneziawg-amd64-3.1.0.msi"
+          and picked[2] == 3641344, repr(picked))
+    picked = pick_awg_asset(fake_assets, "ARM64")
+    check("awg pick arm64 skips others",
+          picked is not None and picked[0] == "amneziawg-arm64-3.1.0.msi")
+    check("awg pick none", pick_awg_asset([], "AMD64") is None)
+    check("awg pick no msi match",
+          pick_awg_asset([{"name": "src.zip",
+                           "browser_download_url": "x", "size": 1}],
+                         "AMD64") is None)
 
     cfg = generate_config("203.0.113.7", 443, "SERVERPUBKEY==",
                           "CLIENTPRIVKEY==", obf=o)
