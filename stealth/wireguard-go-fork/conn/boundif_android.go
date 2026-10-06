@@ -1,0 +1,42 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+ */
+
+package conn
+
+func (bind *StdNetBind) PeekLookAtSocketFd4() (fd int, err error) {
+	sysconn, err := bind.ipv4.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	err = sysconn.Control(func(f uintptr) {
+		fd = int(f)
+	})
+	if err != nil {
+		return -1, err
+	}
+	return
+}
+
+func (bind *StdNetBind) PeekLookAtSocketFd6() (fd int, err error) {
+	sysconn, err := bind.ipv6.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	err = sysconn.Control(func(f uintptr) {
+		fd = int(f)
+	})
+	if err != nil {
+		return -1, err
+	}
+	return
+}
+
+func (bind *StdNetBindTcp) PeekLookAtSocketFd4() (fd int, err error) {
+	return -1, err
+}
+
+func (bind *StdNetBindTcp) PeekLookAtSocketFd6() (fd int, err error) {
+	return -1, err
+}

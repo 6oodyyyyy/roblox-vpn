@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v14"
+APP_VERSION = "v15"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -654,6 +654,211 @@ peer: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy=
 
 
 # ---------------------------------------------------------------------------
+# Stealth backend: WireGuard-over-TLS (Proton Stealth protocol) via a
+# bundled Go binary (stealth-wg.exe) + wintun.dll. Bypasses DPI that
+# fingerprints plain WireGuard UDP. Uses the same .conf (keys/endpoint);
+# the Go binary connects via TCP/443 with uTLS + TunSafe framing.
+# ---------------------------------------------------------------------------
+
+STEALTH_IFNAME = "RobloxVPN-Stealth"
+STEALTH_EXE = "stealth-wg.exe"
+WINTUN_DLL = "wintun.dll"
+
+
+def _stealth_bin(name):
+    """Locate a bundled stealth binary (PyInstaller bundle, app dir, dev)."""
+    cands = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        cands.append(os.path.join(meipass, name))
+    try:
+        cands.append(os.path.join(app_dir(), name))
+    except OSError:
+        pass
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "stealth", "dist", name))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _conf_address(conf):
+    """Extract the IPv4 Address from a .conf (e.g. '10.2.0.2/32' -> '10.2.0.2')."""
+    try:
+        with open(conf, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(r"(?im)^\s*Address\s*=\s*([0-9.]+)", text)
+    return m.group(1) if m else None
+
+
+def _tun_if_index(ifname):
+    """Windows interface index for a TUN adapter name (via netsh)."""
+    ok, out = _run(["netsh", "interface", "ipv4", "show", "interfaces"])
+    if not ok:
+        return None
+    for line in out.splitlines():
+        if ifname.lower() in line.lower():
+            parts = line.split()
+            if parts and parts[0].isdigit():
+                return parts[0]
+    return None
+
+
+class StealthBackend:
+    """Drives stealth-wg.exe (Go, Proton Stealth transport) as a child process.
+
+    The Go binary owns the WireGuard device + TLS transport; this backend
+    handles Windows network setup (IP address + split-tunnel route) and
+    parses the JSON status lines the binary prints to stdout.
+    Requires administrator rights (TUN creation + routes).
+    """
+    name = "stealth"
+
+    def __init__(self):
+        self.proc = None
+        self._latest = {}
+        self._reader = None
+        self._stop_reader = threading.Event()
+        self._exe = None
+        self._if_ip = None
+
+    def available(self):
+        exe = _stealth_bin(STEALTH_EXE)
+        dll = _stealth_bin(WINTUN_DLL)
+        if not exe:
+            return (False, "Stealth engine not found (stealth-wg.exe missing).")
+        if not dll:
+            return (False, "Stealth engine incomplete (wintun.dll missing).")
+        self._exe = exe
+        return True, ""
+
+    def _read_loop(self):
+        try:
+            for line in self.proc.stdout:
+                if self._stop_reader.is_set():
+                    break
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                with threading.Lock():
+                    self._latest = d
+        except Exception:
+            pass
+
+    def connect(self, conf):
+        ok, msg = self.available()
+        if not ok:
+            raise TunnelError(msg)
+        self.disconnect()  # clean slate
+        ip = _conf_address(conf)
+        if not ip:
+            raise TunnelError("could not read Address from config")
+        self._if_ip = ip
+        # wintun.dll must sit next to the exe
+        dll = _stealth_bin(WINTUN_DLL)
+        exe_dir = os.path.dirname(self._exe)
+        try:
+            if os.path.abspath(os.path.dirname(dll)) != os.path.abspath(exe_dir):
+                shutil.copy2(dll, os.path.join(exe_dir, WINTUN_DLL))
+        except OSError:
+            pass
+        self._stop_reader.clear()
+        self._latest = {}
+        try:
+            self.proc = subprocess.Popen(
+                [self._exe, conf, STEALTH_IFNAME],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, text=True, bufsize=1,
+                creationflags=_no_window())
+        except OSError as e:
+            raise TunnelError("could not start stealth engine:\n%s" % e)
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        # wait for ready (up to 40s; TLS+handshake takes a while)
+        deadline = time.time() + 40
+        err_msg = None
+        while time.time() < deadline:
+            with threading.Lock():
+                d = dict(self._latest)
+            if d.get("type") == "ready":
+                break
+            if d.get("type") == "error":
+                err_msg = d.get("message", "unknown error")
+                break
+            if self.proc.poll() is not None:
+                err_msg = "stealth engine exited (code %s)" % self.proc.poll()
+                break
+            time.sleep(0.3)
+        else:
+            err_msg = "stealth engine did not become ready in time"
+        if err_msg:
+            self.disconnect()
+            raise TunnelError(err_msg)
+        # --- Windows network setup: IP + split-tunnel route ---
+        ok, out = _run(["netsh", "interface", "ip", "set", "address",
+                        "name=%s" % STEALTH_IFNAME, "static", ip,
+                        "255.255.255.255"])
+        if not ok:
+            self.disconnect()
+            raise TunnelError("could not set tunnel IP:\n" + out.strip())
+        # Roblox-only route via the tunnel
+        for net4 in ROBLOX_ALLOWED_IPS:
+            addr, bits = net4.split("/")
+            mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
+                            for i in (24, 16, 8, 0))
+            _run(["route", "delete", addr, "mask", mask])
+            ok, out = _run(["route", "add", addr, "mask", mask, ip])
+            if not ok:
+                self.disconnect()
+                raise TunnelError("could not add Roblox route:\n" + out.strip())
+
+    def disconnect(self):
+        for net4 in ROBLOX_ALLOWED_IPS:
+            addr, bits = net4.split("/")
+            mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
+                            for i in (24, 16, 8, 0))
+            _run(["route", "delete", addr, "mask", mask])
+        self._stop_reader.set()
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        self.proc = None
+
+    def get_stats(self):
+        with threading.Lock():
+            d = dict(self._latest)
+        if d.get("type") not in ("status", "ready"):
+            return None
+        rx = int(d.get("rx_bytes", 0))
+        tx = int(d.get("tx_bytes", 0))
+        hs_unix = d.get("last_handshake_unix", 0)
+        if hs_unix:
+            ago = int(time.time() - hs_unix)
+            hs = "%d seconds ago" % ago if ago < 3600 else "ok"
+        else:
+            hs = None
+        if not hs_unix and d.get("type") == "ready":
+            # tunnel up, handshake pending
+            return {"rx_bytes": rx, "tx_bytes": tx, "handshake": None,
+                    "endpoint": "stealth/443"}
+        return {"rx_bytes": rx, "tx_bytes": tx, "handshake": hs,
+                "endpoint": "stealth/443"}
+
+
+# ---------------------------------------------------------------------------
 # Persistent stats + settings
 # ---------------------------------------------------------------------------
 
@@ -738,12 +943,22 @@ def _conf_endpoint():
         return "?"
 
 
+def make_backend(name, mock=False):
+    """Create a tunnel backend by name: 'stealth', 'amneziawg', or mock."""
+    if mock:
+        return MockBackend()
+    if name == "stealth":
+        return StealthBackend()
+    return AmneziaWGBackend()
+
+
 class VpnApp:
     def __init__(self, mock=False):
         self.settings = load_settings()
         self.totals = load_stats()
         self.mock = mock
-        self.backend = MockBackend() if mock else AmneziaWGBackend()
+        self.backend_name = self.settings.get("backend", "amneziawg")
+        self.backend = make_backend(self.backend_name, mock)
         self.connected = False
         self.base_rx = self.base_tx = 0
         self.sess_rx = self.sess_tx = 0
@@ -814,6 +1029,20 @@ class VpnApp:
                          "The VPN engine is ready. Import a .conf to connect.")
         else:
             self.status_msg = "AmneziaWG client missing"
+
+    def set_backend(self, name):
+        """Switch tunnel backend ('amneziawg' or 'stealth'). Disconnects first."""
+        if self.connected:
+            self.do_disconnect()
+        self.backend_name = name
+        self.settings["backend"] = name
+        save_settings(self.settings)
+        self.backend = make_backend(name, self.mock)
+        ok, msg = self.backend.available()
+        self.backend_ok = ok
+        self.backend_msg = msg
+        self.status_msg = ("Ready -- import a config to connect (%s mode)" %
+                           ("Stealth" if name == "stealth" else "AmneziaWG"))
 
     def retry_install(self):
         """Re-run the AmneziaWG auto-install with a fresh download."""
@@ -1156,7 +1385,41 @@ def _open_dashboard(app):
                    variable=adv, command=_toggle_adv, fg=DIM, bg=BG,
                    selectcolor=BG, activebackground=BG, activeforeground=DIM,
                    highlightthickness=0,
-                   font=(FONT, 8)).pack(pady=(0, 12))
+                   font=(FONT, 8)).pack(pady=(0, 6))
+
+    # -- Stealth mode toggle (WireGuard-over-TLS, bypasses DPI) ---------
+    stm = tk.BooleanVar(value=(app.backend_name == "stealth"))
+
+    def _toggle_stealth():
+        new = "stealth" if stm.get() else "amneziawg"
+        if new == app.backend_name:
+            return
+        if app.connected:
+            messagebox.showinfo(
+                "Disconnect first",
+                "Disconnect the VPN before switching engine mode.")
+            stm.set(app.backend_name == "stealth")
+            return
+        app.set_backend(new)
+        if not app.backend_ok:
+            messagebox.showwarning(
+                "Stealth engine",
+                "Stealth mode selected but the engine is not available:\n%s\n\n"
+                "Falling back to AmneziaWG mode." % app.backend_msg)
+            stm.set(False)
+            app.set_backend("amneziawg")
+        else:
+            messagebox.showinfo(
+                "Engine switched",
+                "Now using %s mode.\nImport your ProtonVPN config and connect." %
+                ("Stealth (DPI-resistant)" if new == "stealth" else "AmneziaWG"))
+
+    tk.Checkbutton(win, text="Stealth mode (WireGuard-over-TLS, beats DPI)",
+                   variable=stm, command=_toggle_stealth, fg="#7ec8ff", bg=BG,
+                   selectcolor=BG, activebackground=BG,
+                   activeforeground="#7ec8ff",
+                   highlightthickness=0,
+                   font=(FONT, 9, "bold")).pack(pady=(0, 12))
 
     def _reset_counters():
         if messagebox.askyesno("Reset counters",
@@ -1743,6 +2006,30 @@ def run_self_tests():
         check("mock disconnect", mb.get_stats() is None)
     finally:
         os.unlink(tmp)
+
+    # --- Stealth backend ---
+    check("make_backend stealth", make_backend("stealth").name == "stealth")
+    check("make_backend amneziawg",
+          make_backend("amneziawg").name == "amneziawg")
+    check("make_backend mock", make_backend("x", mock=True).name == "mock")
+    sb = StealthBackend()
+    check("stealth get_stats none when down", sb.get_stats() is None)
+    with tempfile.NamedTemporaryFile("w", suffix=".conf",
+                                     delete=False) as f:
+        f.write("[Interface]\nPrivateKey = AAAA\n"
+                "Address = 10.2.0.2/32, 2a07:b944::2:2/128\n"
+                "[Peer]\nPublicKey = BBBB\nEndpoint = 1.2.3.4:51820\n")
+        tmp2 = f.name
+    try:
+        check("conf_address ipv4", _conf_address(tmp2) == "10.2.0.2")
+    finally:
+        os.unlink(tmp2)
+    check("conf_address missing", _conf_address("/nonexistent.conf") is None)
+    # mask computation used for the Roblox route
+    bits = 17
+    mask = ".".join(str((0xFFFFFFFF << (32 - bits) >> i) & 0xFF)
+                    for i in (24, 16, 8, 0))
+    check("route mask /17", mask == "255.255.128.0", mask)
 
     print("\n%d/%d tests passed" % (total[0] - len(fails), total[0]))
     if fails:

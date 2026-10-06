@@ -2,11 +2,14 @@ name: build-exe
 
 # Builds the real Windows .exe with PyInstaller and smoke-tests it:
 #   dist/RobloxVPN.exe  - tray VPN client (no console, no Python needed)
+# Also builds the Stealth engine (stealth-wg.exe, Go) and bundles it +
+# wintun.dll into the PyInstaller bundle.
 
 on:
   push:
     paths:
       - 'client/**'
+      - 'stealth/**'
       - '.github/workflows/build-exe.yml'
   workflow_dispatch:
 
@@ -21,11 +24,23 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
       - name: Install build deps
         run: pip install pyinstaller -r client/requirements.txt
 
-      - name: Build exe
-        run: pyinstaller --noconfirm --onefile --noconsole --name RobloxVPN client/roblox_vpn.py
+      - name: Build Stealth engine (Go, windows/amd64)
+        run: |
+          cd stealth
+          go build -o dist/stealth-wg.exe .
+          curl -sL -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
+          7z e wintun.zip -odist wintun/bin/amd64/wintun.dll -r
+          dir dist
+
+      - name: Build exe (bundle Stealth engine + wintun)
+        run: pyinstaller --noconfirm --onefile --noconsole --name RobloxVPN --add-binary "stealth/dist/stealth-wg.exe;." --add-binary "stealth/dist/wintun.dll;." client/roblox_vpn.py
 
       - name: Smoke-test exe (built-in self-test, no admin needed)
         run: dist\RobloxVPN.exe --self-test
