@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v20"
+APP_VERSION = "v21"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -664,6 +664,46 @@ STEALTH_IFNAME = "RobloxVPN-Stealth"
 STEALTH_EXE = "stealth-wg.exe"
 
 
+def _kill_stale_stealth():
+    """Kill any leftover stealth-wg.exe processes from previous runs.
+
+    A previous hung run leaves a process blocked in the driver; launching
+    a second one concurrently wedges things further. Never raises.
+    """
+    if os.name != "nt":
+        return
+    ok, out = _run(["taskkill", "/F", "/IM", "stealth-wg.exe"], timeout=10)
+    _stealth_log("taskkill stealth-wg.exe: ok=%s out=%s"
+                 % (ok, out.strip()[:120]))
+
+
+def _clean_phantom_adapters():
+    """Remove stale RobloxVPN-Stealth* PnP devices before creating anew.
+
+    Orphaned adapters from killed runs keep the driver busy and can make
+    WintunCreateAdapter hang. Uses pnputil to remove them. Never raises.
+    """
+    if os.name != "nt":
+        return
+    _stealth_log("enumerating stale RobloxVPN adapters ...")
+    ps = ("Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | "
+          "Where-Object { $_.FriendlyName -like 'RobloxVPN*' } | "
+          "ForEach-Object { $_.InstanceId }")
+    ok, out = _run(["powershell", "-NoProfile", "-Command", ps], timeout=20)
+    _stealth_log("pnp enum: ok=%s out=%s" % (ok, out.strip()[:300]))
+    if not ok or not out.strip():
+        return
+    for inst in out.strip().split():
+        inst = inst.strip()
+        if not inst:
+            continue
+        _stealth_log("removing phantom device: %s" % inst[:80])
+        ok2, out2 = _run(["pnputil", "/remove-device", inst], timeout=20)
+        _stealth_log("pnputil remove: ok=%s out=%s"
+                     % (ok2, out2.strip()[:120]))
+    time.sleep(2)
+
+
 def _reinstall_wintun_driver(dll_path):
     """Force a clean Wintun driver reinstall via WintunDeleteDriver.
 
@@ -790,6 +830,7 @@ class StealthBackend:
         self._stop_reader = threading.Event()
         self._exe = None
         self._if_ip = None
+        self._connect_lock = threading.Lock()
 
     def available(self):
         exe = _stealth_bin(STEALTH_EXE)
@@ -821,15 +862,27 @@ class StealthBackend:
 
     def connect(self, conf):
         _stealth_log("=== connect() start ===")
+        if not self._connect_lock.acquire(blocking=False):
+            raise TunnelError("already connecting -- please wait")
+        try:
+            self._connect_inner(conf)
+        finally:
+            self._connect_lock.release()
+
+    def _connect_inner(self, conf):
         ok, msg = self.available()
         _stealth_log("available: %s %s" % (ok, msg))
         if not ok:
             raise TunnelError(msg)
         self.disconnect()  # clean slate
+        # never run two engines at once -- concurrent WintunCreateAdapter
+        # calls wedge the driver
+        _kill_stale_stealth()
         # unstick the Wintun driver before asking it for an adapter --
         # a wedged driver blocks CreateAdapter forever (no reboot needed)
         _recycle_wintun_driver()
-        _reinstall_wintun_driver(_stealth_bin(WINTUN_DLL))
+        # remove orphaned adapters from killed runs
+        _clean_phantom_adapters()
         ip = _conf_address(conf)
         _stealth_log("tunnel IP from conf: %s" % ip)
         if not ip:
@@ -2136,7 +2189,7 @@ def run_self_tests():
     # Popen expects an int -> TypeError -> silent thread death, UI hangs
     # on "Connecting..." forever. Guard the source directly.
     import inspect as _inspect
-    _src = _inspect.getsource(StealthBackend.connect)
+    _src = _inspect.getsource(StealthBackend._connect_inner)
     check("stealth popen unpacks no_window",
           "creationflags=_no_window()" not in _src
           and "**_no_window()" in _src)
@@ -2146,6 +2199,19 @@ def run_self_tests():
         check("recycle_wintun_driver safe", isinstance(r, bool))
     except Exception as e:  # noqa: BLE001
         check("recycle_wintun_driver safe", False, repr(e))
+    # stale-process kill + phantom cleanup must never raise either
+    try:
+        _kill_stale_stealth()
+        _clean_phantom_adapters()
+        check("stealth cleanup helpers safe", True)
+    except Exception as e:  # noqa: BLE001
+        check("stealth cleanup helpers safe", False, repr(e))
+    # concurrent connects are rejected, not run in parallel
+    _sb2 = StealthBackend()
+    _got = _sb2._connect_lock.acquire(blocking=False)
+    check("connect lock acquirable", _got)
+    if _got:
+        _sb2._connect_lock.release()
 
     print("\n%d/%d tests passed" % (total[0] - len(fails), total[0]))
     if fails:
