@@ -29,7 +29,9 @@ System-tray app (Windows 10/11):
 - **Connect / Disconnect** (tunnel up/down as a Windows service)
 - **Live data counter** — session up/down plus lifetime totals, persisted in
   `%APPDATA%\RobloxVPN\stats.json`. Visible in the tray menu and the dashboard.
-- **Import** any AmneziaWG/WireGuard `.conf` (validated; full-tunnel refused)
+- **Import** any AmneziaWG/WireGuard `.conf` (validated; full-tunnel configs
+  are offered a one-click conversion to Roblox-only split-tunnel, e.g.
+  ProtonVPN free)
 - **Generate** a client config from server details (endpoint, keys) with one
   click, including random obfuscation parameters
 - **Mock mode** (`RobloxVPN.exe --mock`): dry-runs the whole tunnel bring-up

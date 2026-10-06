@@ -207,6 +207,26 @@ def _split_allowed_ips(text):
     return vals
 
 
+def convert_to_split_tunnel(text):
+    """Rewrite a full-tunnel .conf into a Roblox-only split-tunnel .conf.
+
+    Keeps Interface keys, Peer endpoint/keys, DNS, comments -- only the
+    [Peer] AllowedIPs lines are replaced with ROBLOX_ALLOWED_IPS. This is
+    what makes third-party configs (e.g. ProtonVPN free, which ships
+    0.0.0.0/0) usable without burning metered data.
+    Pure -- covered by --self-test.
+    """
+    def _repl_peer(m):
+        body = m.group(1)
+        new_body = re.sub(r"^AllowedIPs\s*=.*$",
+                          "AllowedIPs = " + ", ".join(ROBLOX_ALLOWED_IPS),
+                          body, flags=re.MULTILINE | re.IGNORECASE)
+        return "[Peer]" + new_body
+
+    return re.sub(r"^\[Peer\](.*?)(?=^\[|\Z)", _repl_peer, text,
+                  flags=re.MULTILINE | re.DOTALL)
+
+
 def validate_config_text(text, allow_full_tunnel=False):
     """Validate an imported .conf. Returns (ok, errors, warnings)."""
     errors, warnings = [], []
@@ -946,8 +966,19 @@ def _import_dialog(app):
     allow = bool(app.settings.get("allow_full_tunnel"))
     ok, errors, warnings = validate_config_text(text, allow_full_tunnel=allow)
     if not ok:
-        messagebox.showerror("Config rejected", "\n".join(errors))
-        return
+        # One-click rescue: a full-tunnel config (e.g. ProtonVPN free) can be
+        # converted to Roblox-only split-tunnel, keeping keys/endpoint/DNS.
+        only_full = errors and all("FULL-TUNNEL" in e for e in errors)
+        if only_full and messagebox.askyesno(
+                "Full-tunnel config detected",
+                "This config routes ALL your traffic through the VPN "
+                "(burns mobile data).\n\nConvert it to Roblox-only "
+                "split-tunnel?\n(Keys, server and endpoint are kept.)"):
+            text = convert_to_split_tunnel(text)
+            ok, errors, warnings = validate_config_text(text)
+        if not ok:
+            messagebox.showerror("Config rejected", "\n".join(errors))
+            return
     if warnings and not messagebox.askyesno(
             "Import with warnings?", "\n".join(warnings) +
             "\n\nImport anyway?"):
@@ -1147,6 +1178,16 @@ def run_self_tests():
                                                for e in errs))
     ok, errs, _ = validate_config_text(full, allow_full_tunnel=True)
     check("allow full tunnel override", ok, "; ".join(errs))
+    conv = convert_to_split_tunnel(full)
+    check("convert drops 0.0.0.0/0",
+          "0.0.0.0/0" not in conv and "::/0" not in conv, conv[:200])
+    check("convert adds roblox range", "128.116.0.0/17" in conv)
+    check("convert keeps endpoint", "Endpoint = 203.0.113.7:443" in conv)
+    check("convert keeps keys",
+          "PrivateKey = CLIENTPRIVKEY==" in conv
+          and "PublicKey = SERVERPUBKEY==" in conv)
+    ok, errs, _ = validate_config_text(conv)
+    check("convert validates clean", ok, "; ".join(errs))
     ok, errs, _ = validate_config_text("[Interface]\nPrivateKey = x\n")
     check("reject malformed", not ok and len(errs) >= 2, "; ".join(errs))
     ok, _, warns = validate_config_text(
