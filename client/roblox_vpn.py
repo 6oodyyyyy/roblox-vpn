@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v15"
+APP_VERSION = "v16"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -707,6 +707,16 @@ def _tun_if_index(ifname):
     return None
 
 
+def _stealth_log(msg):
+    """Append a timestamped line to the Stealth debug log."""
+    try:
+        p = os.path.join(app_dir(), "stealth-debug.log")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
 class StealthBackend:
     """Drives stealth-wg.exe (Go, Proton Stealth transport) as a child process.
 
@@ -747,38 +757,54 @@ class StealthBackend:
                     d = json.loads(line)
                 except ValueError:
                     continue
+                _stealth_log("engine -> %s" % line[:200])
                 with threading.Lock():
                     self._latest = d
-        except Exception:
-            pass
+        except Exception as e:
+            _stealth_log("reader thread ended: %s" % e)
 
     def connect(self, conf):
+        _stealth_log("=== connect() start ===")
         ok, msg = self.available()
+        _stealth_log("available: %s %s" % (ok, msg))
         if not ok:
             raise TunnelError(msg)
         self.disconnect()  # clean slate
         ip = _conf_address(conf)
+        _stealth_log("tunnel IP from conf: %s" % ip)
         if not ip:
             raise TunnelError("could not read Address from config")
         self._if_ip = ip
         # wintun.dll must sit next to the exe
         dll = _stealth_bin(WINTUN_DLL)
         exe_dir = os.path.dirname(self._exe)
+        _stealth_log("exe: %s" % self._exe)
+        _stealth_log("dll: %s" % dll)
         try:
-            if os.path.abspath(os.path.dirname(dll)) != os.path.abspath(exe_dir):
+            if dll and os.path.abspath(os.path.dirname(dll)) != os.path.abspath(exe_dir):
                 shutil.copy2(dll, os.path.join(exe_dir, WINTUN_DLL))
-        except OSError:
-            pass
+                _stealth_log("copied wintun.dll next to exe")
+        except OSError as e:
+            _stealth_log("dll copy failed: %s" % e)
         self._stop_reader.clear()
         self._latest = {}
+        # capture Go stderr to a file for diagnosis
+        try:
+            err_log = open(os.path.join(app_dir(), "stealth-go-stderr.log"),
+                           "w", encoding="utf-8")
+        except OSError:
+            err_log = subprocess.DEVNULL
+        _stealth_log("launching stealth-wg.exe ...")
         try:
             self.proc = subprocess.Popen(
                 [self._exe, conf, STEALTH_IFNAME],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=err_log,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
                 creationflags=_no_window())
         except OSError as e:
+            _stealth_log("Popen failed: %s" % e)
             raise TunnelError("could not start stealth engine:\n%s" % e)
+        _stealth_log("process started, pid=%s" % self.proc.pid)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
         # wait for ready (up to 40s; TLS+handshake takes a while)
@@ -788,23 +814,29 @@ class StealthBackend:
             with threading.Lock():
                 d = dict(self._latest)
             if d.get("type") == "ready":
+                _stealth_log("got READY from engine")
                 break
             if d.get("type") == "error":
                 err_msg = d.get("message", "unknown error")
+                _stealth_log("got ERROR from engine: %s" % err_msg)
                 break
             if self.proc.poll() is not None:
                 err_msg = "stealth engine exited (code %s)" % self.proc.poll()
+                _stealth_log(err_msg)
                 break
             time.sleep(0.3)
         else:
             err_msg = "stealth engine did not become ready in time"
+            _stealth_log("TIMEOUT waiting for ready; last status: %s" % d)
         if err_msg:
             self.disconnect()
             raise TunnelError(err_msg)
         # --- Windows network setup: IP + split-tunnel route ---
+        _stealth_log("setting tunnel IP via netsh ...")
         ok, out = _run(["netsh", "interface", "ip", "set", "address",
                         "name=%s" % STEALTH_IFNAME, "static", ip,
                         "255.255.255.255"])
+        _stealth_log("netsh result: ok=%s out=%s" % (ok, out.strip()[:200]))
         if not ok:
             self.disconnect()
             raise TunnelError("could not set tunnel IP:\n" + out.strip())
@@ -815,9 +847,11 @@ class StealthBackend:
                             for i in (24, 16, 8, 0))
             _run(["route", "delete", addr, "mask", mask])
             ok, out = _run(["route", "add", addr, "mask", mask, ip])
+            _stealth_log("route add %s: ok=%s" % (net4, ok))
             if not ok:
                 self.disconnect()
                 raise TunnelError("could not add Roblox route:\n" + out.strip())
+        _stealth_log("=== connect() done ===")
 
     def disconnect(self):
         for net4 in ROBLOX_ALLOWED_IPS:
