@@ -164,10 +164,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 1. TUN device
-	tunDev, err := tun.CreateTUN(ifName, defaultMTU)
-	if err != nil {
-		emit(StatusLine{Type: "error", Message: "create TUN: " + err.Error()})
+	// 1. TUN device (with timeout: a stuck Wintun driver can block
+	// CreateTUN forever -- fail with a clear message instead of hanging)
+	type tunResult struct {
+		dev tun.Device
+		err error
+	}
+	tunCh := make(chan tunResult, 1)
+	go func() {
+		d, e := tun.CreateTUN(ifName, defaultMTU)
+		tunCh <- tunResult{d, e}
+	}()
+	var tunDev tun.Device
+	select {
+	case r := <-tunCh:
+		if r.err != nil {
+			emit(StatusLine{Type: "error", Message: "create TUN: " + r.err.Error()})
+			os.Exit(1)
+		}
+		tunDev = r.dev
+	case <-time.After(25 * time.Second):
+		emit(StatusLine{Type: "error", Message: "Wintun adapter creation timed out " +
+			"(driver stuck). Please restart your PC and try again."})
 		os.Exit(1)
 	}
 
