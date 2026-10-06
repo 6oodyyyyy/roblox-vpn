@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v19"
+APP_VERSION = "v20"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -664,6 +664,38 @@ STEALTH_IFNAME = "RobloxVPN-Stealth"
 STEALTH_EXE = "stealth-wg.exe"
 
 
+def _reinstall_wintun_driver(dll_path):
+    """Force a clean Wintun driver reinstall via WintunDeleteDriver.
+
+    A wedged driver can survive a service restart (sc stop/start) but a
+    full delete forces wintun.dll to reinstall it from scratch on the
+    next CreateAdapter ('Installing driver' path). Runs in a thread with
+    a timeout in case the driver is too wedged to respond.
+    """
+    if os.name != "nt" or not dll_path or not os.path.isfile(dll_path):
+        return
+    _stealth_log("forcing clean wintun driver reinstall ...")
+    import ctypes
+
+    def _do():
+        try:
+            w = ctypes.WinDLL(dll_path)
+            # WintunDeleteDriver returns BOOL; 0 + GetLastError on failure
+            rc = w.WintunDeleteDriver()
+            _stealth_log("WintunDeleteDriver rc=%s" % rc)
+        except Exception as e:  # noqa: BLE001
+            _stealth_log("WintunDeleteDriver failed: %r" % e)
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout=20)
+    if t.is_alive():
+        _stealth_log("WintunDeleteDriver hung; driver reinstall skipped")
+    else:
+        _stealth_log("driver delete done; dll will reinstall on next use")
+        time.sleep(2)
+
+
 def _recycle_wintun_driver():
     """Restart the Wintun driver service to unstick a wedged driver.
 
@@ -797,6 +829,7 @@ class StealthBackend:
         # unstick the Wintun driver before asking it for an adapter --
         # a wedged driver blocks CreateAdapter forever (no reboot needed)
         _recycle_wintun_driver()
+        _reinstall_wintun_driver(_stealth_bin(WINTUN_DLL))
         ip = _conf_address(conf)
         _stealth_log("tunnel IP from conf: %s" % ip)
         if not ip:
