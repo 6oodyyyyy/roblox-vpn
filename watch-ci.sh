@@ -5,6 +5,7 @@
 set -u
 REPO="6oodyyyyy/roblox-vpn"
 OUTDIR="$HOME/workspace/roblox-vpn/dist"
+VERSION="${1:-}"  # optional version suffix (e.g. v12); saved before `set --` clobbers $1
 TOK=$(cat "$HOME/.config/gh_toto_token")
 AUTH="Authorization: Basic $(printf '6oodyyyyy:%s' "$TOK" | base64 -w0)"
 unset TOK
@@ -49,10 +50,10 @@ curl -sL -H "$AUTH" -o /tmp/robloxvnp-exe.zip \
 unzip -o /tmp/robloxvnp-exe.zip -d "$OUTDIR" >/dev/null
 rm -f /tmp/robloxvnp-exe.zip
 ls -la "$OUTDIR/RobloxVPN.exe"
-# Optional $1 = version suffix (e.g. v11): keep a versioned copy so downloads
+# Optional VERSION = version suffix (e.g. v12): keep a versioned copy so downloads
 # never serve a stale cached file under the same name.
-if [ -n "${1:-}" ]; then
-  cp "$OUTDIR/RobloxVPN.exe" "$OUTDIR/RobloxVPN-$1.exe"
-  ls -la "$OUTDIR/RobloxVPN-$1.exe"
+if [ -n "$VERSION" ]; then
+  cp "$OUTDIR/RobloxVPN.exe" "$OUTDIR/RobloxVPN-$VERSION.exe"
+  ls -la "$OUTDIR/RobloxVPN-$VERSION.exe"
 fi
 echo "DONE: new exe in $OUTDIR"
