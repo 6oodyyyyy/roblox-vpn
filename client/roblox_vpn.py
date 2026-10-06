@@ -62,6 +62,12 @@ CLIENT_ADDRESS = "10.8.0.2/32"
 SERVER_NETWORK = "10.8.0.0/24"
 PERSISTENT_KEEPALIVE = 25   # seconds; keeps NAT mapping alive, ~bytes/min
 
+# Links used by the built-in setup guide (first-run onboarding).
+GUIDE_LINKS = {
+    "proton_free": "https://protonvpn.com/free-vpn",
+    "proton_wg": "https://account.protonvpn.com/downloads",
+}
+
 
 def _app_dir():
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -757,6 +763,7 @@ class VpnApp:
             items.append(MenuItem("Connect", lambda i: self.do_connect()))
         items += [
             MenuItem("Open dashboard", lambda i: self.open_dashboard()),
+            MenuItem("Setup guide...", lambda i: self.open_guide()),
             MenuItem("Import .conf...", lambda i: self.import_dialog()),
             MenuItem("Generate config...", lambda i: self.generate_dialog()),
             MenuItem("Open config folder", lambda i: self.open_folder()),
@@ -802,6 +809,9 @@ class VpnApp:
         self.root.withdraw()
         threading.Thread(target=self._poll_loop, daemon=True).start()
         threading.Thread(target=self._run_tray, daemon=True).start()
+        if not self.settings.get("guide_seen"):
+            # First run: pop the 4-step setup guide with links + buttons.
+            self.root.after(2500, lambda: _open_guide(self))
         if not self.backend_ok and not self.mock:
             # The auto-installer runs in the background; warn only if it
             # finished without producing a working backend.
@@ -950,6 +960,78 @@ def _open_dashboard(app):
     refresh()
 
 
+def _open_guide(app):
+    """First-run setup guide: the 4 steps with links and in-app buttons.
+
+    Opens automatically once (until dismissed); re-openable from the tray
+    menu ("Setup guide...").
+    """
+    import tkinter as tk
+    import webbrowser
+    existing = getattr(app, "guide_win", None)
+    if existing is not None:
+        try:
+            existing.lift()
+            existing.focus_force()
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    win = tk.Toplevel(app.root)
+    app.guide_win = win
+    win.title("RobloxVPN setup - 4 steps")
+    win.resizable(False, False)
+
+    def _link(parent, text, url):
+        lbl = tk.Label(parent, text="\u2197 " + text, fg="blue",
+                       cursor="hand2",
+                       font=("TkDefaultFont", 9, "underline"))
+        lbl.pack(anchor="w")
+        lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
+
+    steps = [
+        ("1. Create a free ProtonVPN account",
+         "Email only - no credit card needed.",
+         ("Open protonvpn.com", GUIDE_LINKS["proton_free"]), None),
+        ("2. Download a WireGuard config",
+         "On account.protonvpn.com go to Downloads -> WireGuard "
+         "configuration, choose a Netherlands server, press Create, then "
+         "Download the .conf file.",
+         ("Open config page", GUIDE_LINKS["proton_wg"]), None),
+        ("3. Import the .conf here",
+         "You will be offered a one-click conversion to Roblox-only "
+         "split-tunnel, so data usage stays minimal.",
+         None, ("Import .conf...", app.import_dialog)),
+        ("4. Connect, then open Roblox",
+         "The tray icon shows live data usage. Disconnect when done "
+         "playing - the tunnel never starts on its own.",
+         None, ("Connect now", app.do_connect)),
+    ]
+    for title, desc, link, btn in steps:
+        f = tk.Frame(win, padx=14, pady=7)
+        f.pack(fill="x", anchor="w")
+        tk.Label(f, text=title,
+                 font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+        tk.Label(f, text=desc, wraplength=400, justify="left").pack(anchor="w")
+        if link:
+            _link(f, link[0], link[1])
+        if btn:
+            tk.Button(f, text=btn[0], command=btn[1]).pack(anchor="w",
+                                                           pady=(5, 0))
+
+    var = tk.BooleanVar(value=True)
+    tk.Checkbutton(win, text="Don't show this guide again",
+                   variable=var).pack(pady=(2, 10))
+
+    def on_close():
+        if var.get():
+            app.settings["guide_seen"] = True
+            save_settings(app.settings)
+        app.guide_win = None
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+
+
 def _import_dialog(app):
     from tkinter import filedialog, messagebox
     p = filedialog.askopenfilename(
@@ -1079,6 +1161,7 @@ def _generate_dialog(app):
 
 # Attach dialog entry points to VpnApp (kept out of the class body for clarity)
 VpnApp.open_dashboard = lambda self: _open_dashboard(self)
+VpnApp.open_guide = lambda self: _open_guide(self)
 VpnApp.import_dialog = lambda self: _import_dialog(self)
 VpnApp.generate_dialog = lambda self: _generate_dialog(self)
 
@@ -1198,6 +1281,10 @@ def run_self_tests():
     ok, _, warns = validate_config_text(plain_wg)
     check("warn plain wireguard", ok and any("obfuscation" in w
                                              for w in warns))
+
+    check("guide links https",
+          len(GUIDE_LINKS) >= 2
+          and all(v.startswith("https://") for v in GUIDE_LINKS.values()))
 
     # MockBackend cycle (uses a temp conf file)
     import tempfile

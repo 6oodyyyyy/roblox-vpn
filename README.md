@@ -51,9 +51,12 @@ System-tray app (Windows 10/11):
 ### Quick start
 
 1. Run `RobloxVPN.exe` (accept the UAC prompt).
-2. Tray icon → **Import .conf...** and pick the client config from your server
-   (or **Generate config...** if you have the server keys).
-3. **Connect**. Open Roblox only after the tray shows "Connected".
+2. On first launch a **setup guide** opens with the 4 steps, links, and
+   buttons (re-open anytime from the tray menu → "Setup guide..."):
+   create a free ProtonVPN account → download a WireGuard `.conf`
+   (Netherlands server) → **Import .conf...** in the app (full-tunnel
+   configs are offered a one-click conversion to Roblox-only split-tunnel)
+   → **Connect**. Open Roblox only after the tray shows "Connected".
 
 ## The server
 
