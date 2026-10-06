@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v10"
+APP_VERSION = "v11"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -234,6 +234,29 @@ def convert_to_split_tunnel(text):
                   flags=re.MULTILINE | re.DOTALL)
 
 
+AWG_OBF_KEYS = ("Jc", "Jmin", "Jmax",
+                "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4")
+
+
+def has_obfuscation(text):
+    """True if the config enables AmneziaWG obfuscation (Jc/S/H params)."""
+    return any(re.search(r"^%s\s*=" % k, text,
+                        re.MULTILINE | re.IGNORECASE)
+               for k in AWG_OBF_KEYS)
+
+
+def strip_obfuscation(text):
+    """Remove AmneziaWG obfuscation params from a config.
+
+    Needed when a config made for a private AmneziaWG server is used against
+    a plain-WireGuard server (e.g. ProtonVPN): the obfuscated handshake is
+    unparseable there, so it stays stuck at "waiting for handshake" forever.
+    Keeps keys, endpoint, DNS and AllowedIPs untouched. Pure -- self-tested.
+    """
+    return re.sub(r"^(Jc|Jmin|Jmax|S[1-4]|H[1-4])\s*=.*$\n?",
+                  "", text, flags=re.MULTILINE | re.IGNORECASE)
+
+
 def validate_config_text(text, allow_full_tunnel=False):
     """Validate an imported .conf. Returns (ok, errors, warnings)."""
     errors, warnings = [], []
@@ -259,7 +282,7 @@ def validate_config_text(text, allow_full_tunnel=False):
         warnings.append(
             "AllowedIPs does not include the Roblox range %s; Roblox may not "
             "be routed through the tunnel." % ", ".join(ROBLOX_ALLOWED_IPS))
-    has_awg = any(k in text for k in ("Jc =", "Jc=", "S1 =", "S1="))
+    has_awg = has_obfuscation(text)
     if not has_awg:
         warnings.append(
             "no AmneziaWG obfuscation params (Jc/S1..) found -- plain "
@@ -989,6 +1012,10 @@ def _open_dashboard(app):
     title.pack()
     sub = tk.Label(hero, text="", fg=DIM, bg=BG, font=(FONT, 9))
     sub.pack(pady=(2, 0))
+    obf_warn = tk.Label(hero, text="", fg=AMBER, bg=BG,
+                        font=(FONT, 8, "bold"), wraplength=280,
+                        justify="center")
+    obf_warn.pack(pady=(2, 0))
 
     # -- main action -------------------------------------------------
     main_btn = tk.Button(win, text="Connect", fg="white", bg=GREEN,
@@ -1073,6 +1100,16 @@ def _open_dashboard(app):
             return
         s = _v(app)
         st = s["status"]
+        try:
+            with open(conf_path(), encoding="utf-8",
+                      errors="replace") as f:
+                obf_on = has_obfuscation(f.read())
+        except OSError:
+            obf_on = False
+        obf_warn.config(
+            text="Obfuscation is ON -- ProtonVPN servers need it OFF.\n"
+                 "Re-import the original file and choose Strip."
+            if obf_on else "")
         if s["connected"]:
             color = GREEN
             title.config(text="Connected")
@@ -1255,6 +1292,18 @@ def _import_dialog(app):
                 "split-tunnel?\n(Keys, server and endpoint are kept.)"):
             text = convert_to_split_tunnel(text)
             ok, errors, warnings = validate_config_text(text)
+        if not ok:
+            messagebox.showerror("Config rejected", "\n".join(errors))
+            return
+    if has_obfuscation(text) and messagebox.askyesno(
+            "Obfuscation detected",
+            "This config has AmneziaWG obfuscation turned ON.\n\n"
+            "ProtonVPN servers use plain WireGuard and cannot understand "
+            "obfuscated handshakes -- the connection would stay stuck at "
+            "\"waiting for handshake\" forever.\n\n"
+            "Strip the obfuscation for ProtonVPN?"):
+        text = strip_obfuscation(text)
+        ok, errors, warnings = validate_config_text(text)
         if not ok:
             messagebox.showerror("Config rejected", "\n".join(errors))
             return
@@ -1475,6 +1524,25 @@ def run_self_tests():
           and "PublicKey = SERVERPUBKEY==" in conv)
     ok, errs, _ = validate_config_text(conv)
     check("convert validates clean", ok, "; ".join(errs))
+    obf_cfg = ("[Interface]\nPrivateKey = CLIENTPRIVKEY==\n"
+               "Jc = 4\nJmin = 10\nJmax = 60\nS1 = 30\nH1 = 12345\n"
+               "[Peer]\nPublicKey = SERVERPUBKEY==\n"
+               "Endpoint = 203.0.113.7:443\nAllowedIPs = 128.116.0.0/17\n")
+    check("has_obfuscation detects", has_obfuscation(obf_cfg))
+    plain_cfg = ("[Interface]\nPrivateKey = CLIENTPRIVKEY==\n"
+                 "[Peer]\nPublicKey = SERVERPUBKEY==\n"
+                 "Endpoint = 203.0.113.7:443\nAllowedIPs = 128.116.0.0/17\n")
+    check("has_obfuscation clean", not has_obfuscation(plain_cfg))
+    stripped = strip_obfuscation(obf_cfg)
+    check("strip removes Jc/S/H",
+          not has_obfuscation(stripped)
+          and "Jc" not in stripped and "S1" not in stripped)
+    check("strip keeps keys/endpoint",
+          "PrivateKey = CLIENTPRIVKEY==" in stripped
+          and "Endpoint = 203.0.113.7:443" in stripped
+          and "AllowedIPs = 128.116.0.0/17" in stripped)
+    ok, errs, _ = validate_config_text(stripped)
+    check("stripped validates clean", ok, "; ".join(errs))
     ok, errs, _ = validate_config_text("[Interface]\nPrivateKey = x\n")
     check("reject malformed", not ok and len(errs) >= 2, "; ".join(errs))
     ok, _, warns = validate_config_text(
