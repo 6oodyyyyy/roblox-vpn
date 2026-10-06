@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v16"
+APP_VERSION = "v17"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -800,9 +800,10 @@ class StealthBackend:
                 [self._exe, conf, STEALTH_IFNAME],
                 stdout=subprocess.PIPE, stderr=err_log,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
-                creationflags=_no_window())
-        except OSError as e:
-            _stealth_log("Popen failed: %s" % e)
+                **_no_window())
+        except Exception as e:  # noqa: BLE001 -- any launch failure must
+            # surface as TunnelError, never kill the worker thread silently
+            _stealth_log("Popen failed: %r" % e)
             raise TunnelError("could not start stealth engine:\n%s" % e)
         _stealth_log("process started, pid=%s" % self.proc.pid)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -1103,6 +1104,11 @@ class VpnApp:
             except TunnelError as e:
                 self.status_msg = "Connect failed"
                 self._notify("Connect failed", str(e)[:300])
+                return
+            except Exception as e:  # noqa: BLE001 -- never hang silently
+                self.status_msg = "Connect failed"
+                self._notify("Connect failed",
+                             "Unexpected error: %s" % str(e)[:300])
                 return
             # wait for a real handshake
             st = None
@@ -2064,6 +2070,16 @@ def run_self_tests():
     mask = ".".join(str((0xFFFFFFFF << (32 - bits) >> i) & 0xFF)
                     for i in (24, 16, 8, 0))
     check("route mask /17", mask == "255.255.128.0", mask)
+
+    # --- regression: stealth Popen must unpack _no_window() kwargs ---
+    # v16 shipped creationflags=_no_window() which passes a dict where
+    # Popen expects an int -> TypeError -> silent thread death, UI hangs
+    # on "Connecting..." forever. Guard the source directly.
+    import inspect as _inspect
+    _src = _inspect.getsource(StealthBackend.connect)
+    check("stealth popen unpacks no_window",
+          "creationflags=_no_window()" not in _src
+          and "**_no_window()" in _src)
 
     print("\n%d/%d tests passed" % (total[0] - len(fails), total[0]))
     if fails:
