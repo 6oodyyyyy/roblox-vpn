@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v9"
+APP_VERSION = "v10"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -886,6 +886,9 @@ class VpnApp:
         self.root.withdraw()
         threading.Thread(target=self._poll_loop, daemon=True).start()
         threading.Thread(target=self._run_tray, daemon=True).start()
+        # The dashboard is the app's main window: open it on every launch.
+        # Closing it only hides it back to the tray (Quit lives in the menu).
+        self.root.after(800, self.open_dashboard)
         if not self.settings.get("guide_seen"):
             # First run: pop the 4-step setup guide with links + buttons.
             self.root.after(2500, lambda: _open_guide(self))
