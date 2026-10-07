@@ -36,7 +36,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "RobloxVPN"
-APP_VERSION = "v21"
+APP_VERSION = "v22"
 TUNNEL_NAME = "roblox"
 SERVICE_NAME = "AmneziaWGTunnel$" + TUNNEL_NAME
 
@@ -661,6 +661,18 @@ peer: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy=
 # ---------------------------------------------------------------------------
 
 STEALTH_IFNAME = "RobloxVPN-Stealth"
+
+
+def _unique_ifname():
+    """Generate a unique Stealth interface name per connect attempt.
+
+    Reusing a fixed name/GUID can hit stale driver state (orphaned
+    adapters, GUID conflicts) that makes WintunCreateAdapter hang. A
+    fresh name + nil GUID (driver-generated) sidesteps all of it; the
+    wintun.dll cleans up orphans automatically.
+    """
+    import random
+    return "RobloxVPN-S%d" % random.randint(1000, 99999)
 STEALTH_EXE = "stealth-wg.exe"
 
 
@@ -901,6 +913,9 @@ class StealthBackend:
             _stealth_log("dll copy failed: %s" % e)
         self._stop_reader.clear()
         self._latest = {}
+        # unique interface name per attempt (avoids stale name/GUID state)
+        self._ifname = _unique_ifname()
+        _stealth_log("interface name: %s" % self._ifname)
         # capture Go stderr to a file for diagnosis
         try:
             err_log = open(os.path.join(app_dir(), "stealth-go-stderr.log"),
@@ -910,7 +925,7 @@ class StealthBackend:
         _stealth_log("launching stealth-wg.exe ...")
         try:
             self.proc = subprocess.Popen(
-                [self._exe, conf, STEALTH_IFNAME],
+                [self._exe, conf, self._ifname],
                 stdout=subprocess.PIPE, stderr=err_log,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
                 **_no_window())
@@ -921,8 +936,9 @@ class StealthBackend:
         _stealth_log("process started, pid=%s" % self.proc.pid)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
-        # wait for ready (up to 40s; TLS+handshake takes a while)
-        deadline = time.time() + 40
+        # wait for ready (up to 60s; TLS+handshake takes a while, and a
+        # slow driver should get a chance)
+        deadline = time.time() + 60
         err_msg = None
         while time.time() < deadline:
             with threading.Lock():
@@ -948,7 +964,7 @@ class StealthBackend:
         # --- Windows network setup: IP + split-tunnel route ---
         _stealth_log("setting tunnel IP via netsh ...")
         ok, out = _run(["netsh", "interface", "ip", "set", "address",
-                        "name=%s" % STEALTH_IFNAME, "static", ip,
+                        "name=%s" % self._ifname, "static", ip,
                         "255.255.255.255"])
         _stealth_log("netsh result: ok=%s out=%s" % (ok, out.strip()[:200]))
         if not ok:

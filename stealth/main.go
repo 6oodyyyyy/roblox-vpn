@@ -172,7 +172,10 @@ func main() {
 	}
 	tunCh := make(chan tunResult, 1)
 	go func() {
-		d, e := tun.CreateTUN(ifName, defaultMTU)
+		// nil GUID: let the driver generate a fresh one each time.
+		// Reusing the static GUID can hit stale registry state from
+		// previous (killed) runs and wedge WintunCreateAdapter.
+		d, e := tun.CreateTUNWithRequestedGUID(ifName, nil, defaultMTU)
 		tunCh <- tunResult{d, e}
 	}()
 	var tunDev tun.Device
