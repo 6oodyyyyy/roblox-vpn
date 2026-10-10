@@ -1,0 +1,115 @@
+# Roblox — complete domain list for split-tunnel routing
+# One domain per line. Lines starting with # are comments.
+# TIP FOR THE APP: also match wildcards *.roblox.com and *.rbxcdn.com
+# as a catch-all so future/undocumented subdomains keep working.
+
+# ---------- CORE (website / auth / api) ----------
+roblox.com
+www.roblox.com
+web.roblox.com
+m.roblox.com
+api.roblox.com
+apis.roblox.com
+auth.roblox.com
+accountsettings.roblox.com
+accountinformation.roblox.com
+
+# ---------- GAME CLIENT (join / settings / updates) ----------
+gamejoin.roblox.com
+games.roblox.com
+setup.roblox.com
+clientsettings.roblox.com
+clientsettingscdn.roblox.com
+assetdelivery.roblox.com
+gamepersistence.roblox.com
+voice.roblox.com
+
+# ---------- CDN (rbxcdn.com) ----------
+rbxcdn.com
+www.rbxcdn.com
+cdn.rbxcdn.com
+setup.rbxcdn.com
+static.rbxcdn.com
+js.rbxcdn.com
+css.rbxcdn.com
+images.rbxcdn.com
+t0.rbxcdn.com
+t1.rbxcdn.com
+t2.rbxcdn.com
+t3.rbxcdn.com
+t4.rbxcdn.com
+t5.rbxcdn.com
+t6.rbxcdn.com
+t7.rbxcdn.com
+c0.rbxcdn.com
+c1.rbxcdn.com
+c2.rbxcdn.com
+c3.rbxcdn.com
+c4.rbxcdn.com
+c5.rbxcdn.com
+c6.rbxcdn.com
+c7.rbxcdn.com
+sc0gcp.rbxcdn.com
+hls-segments.rbxcdn.com
+
+# ---------- FEATURE APIs ----------
+avatar.roblox.com
+catalog.roblox.com
+inventory.roblox.com
+users.roblox.com
+friends.roblox.com
+groups.roblox.com
+chat.roblox.com
+presence.roblox.com
+notifications.roblox.com
+economy.roblox.com
+billing.roblox.com
+trades.roblox.com
+badges.roblox.com
+contacts.roblox.com
+follows.roblox.com
+thumbnails.roblox.com
+thumbnailsresizer.roblox.com
+metrics.roblox.com
+abtesting.roblox.com
+ads.roblox.com
+captcha.roblox.com
+abuse.roblox.com
+locale.roblox.com
+translations.roblox.com
+premiumfeatures.roblox.com
+kudos.roblox.com
+points.roblox.com
+events.roblox.com
+publish.roblox.com
+data.roblox.com
+ecsv2.roblox.com
+
+# ---------- CREATOR / DEVELOPER ----------
+create.roblox.com
+develop.roblox.com
+devforum.roblox.com
+
+# ---------- SUPPORT / STATUS / INFO ----------
+help.roblox.com
+en.help.roblox.com
+status.roblox.com
+blog.roblox.com
+corp.roblox.com
+
+# ---------- ROBLOX CHINA (Tencent) ----------
+roblox.qq.com
+
+# ---------- OTHER ROBLOX-OWNED ----------
+robloxlabs.com
+www.robloxlabs.com
+
+# ---------- THIRD-PARTY services the Roblox client itself contacts ----------
+# (Arkose Labs = the captcha provider used by Roblox login)
+roblox-api.arkoselabs.com
+
+# ---------- TEST / INTERNAL (optional — staff/test environments) ----------
+gametest.roblox.com
+sitetest.roblox.com
+gametest.robloxlabs.com
+sitetest.robloxlabs.com

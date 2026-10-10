@@ -24,6 +24,7 @@ import platform
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -248,6 +249,152 @@ def _is_private_ip(ip):
         except (IndexError, ValueError):
             return False
     return ip.startswith("fc00:") or ip.startswith("fd00:")
+
+
+# ---------------------------------------------------------------------------
+# Domain-aware split tunnel.
+#
+# Not every Roblox endpoint lives in 128.116.0.0/17. In particular
+# auth.roblox.com is Cloudflare (104.18.x.x). If login/auth traffic goes
+# direct, Roblox sees the real Egyptian IP at login and region-locks the
+# session ("Chat is not available in your region") even though game traffic
+# is tunneled. So at connect time we resolve every domain in
+# roblox-domains.txt and extend BOTH the Windows routes and the WireGuard
+# AllowedIPs (cryptokey routing) with the resulting /32s. The VPN endpoint
+# IP itself is always excluded (routing-loop protection).
+# ---------------------------------------------------------------------------
+
+#: Builtin fallback when roblox-domains.txt is not shipped next to the app.
+_FALLBACK_ROBLOX_DOMAINS = [
+    "auth.roblox.com",
+    "www.roblox.com",
+    "web.roblox.com",
+    "api.roblox.com",
+    "chat.roblox.com",
+    "gamejoin.roblox.com",
+    "clientsettings.roblox.com",
+    "accountsettings.roblox.com",
+    "voice.roblox.com",
+    "roblox.com",
+]
+
+#: Safety cap on resolved /32s (a domain list should never need more).
+_MAX_DOMAIN_IPS = 256
+
+
+def _domains_file_paths():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [os.path.join(app_dir(), "roblox-domains.txt"),
+            os.path.join(here, "roblox-domains.txt")]
+
+
+def load_roblox_domains():
+    """Return the split-tunnel domain list (txt file or builtin fallback)."""
+    for path in _domains_file_paths():
+        try:
+            with open(path, encoding="utf-8") as f:
+                domains = [ln.strip().lower() for ln in f
+                           if ln.strip() and not ln.strip().startswith("#")]
+            if domains:
+                return domains
+        except OSError:
+            continue
+    return list(_FALLBACK_ROBLOX_DOMAINS)
+
+
+def resolve_roblox_ips(domains):
+    """Resolve domains -> sorted list of public IPv4 strings. Never raises."""
+    ips = set()
+    for d in domains:
+        try:
+            for _fam, _typ, _proto, _canon, sockaddr in socket.getaddrinfo(
+                    d, None, socket.AF_INET):
+                ip = sockaddr[0]
+                if not _is_private_ip(ip):
+                    ips.add(ip)
+        except Exception:
+            continue
+        if len(ips) >= _MAX_DOMAIN_IPS:
+            break
+    return sorted(ips)
+
+
+def _conf_endpoint_host(conf_text):
+    m = re.search(r"^Endpoint\s*=\s*(\S+)", conf_text,
+                  re.MULTILINE | re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).rsplit(":", 1)[0].strip("[]")
+
+
+def _resolve_host_ips(host):
+    try:
+        return {sa[0] for _f, _t, _p, _c, sa in
+                socket.getaddrinfo(host, None, socket.AF_INET)}
+    except Exception:
+        return set()
+
+
+def extend_allowed_ips(base_ips, extra_ips, exclude_ips=()):
+    """Merge base nets + /32 extras, minus exclusions. Pure.
+
+    Exclusions match in both bare-IP and CIDR form, so excluding the
+    VPN endpoint IP also excludes its /32.
+    """
+    def _forms(net):
+        net = net.strip()
+        return {net, net.split("/")[0]} if net else set()
+    seen = set()
+    for x in exclude_ips:
+        seen |= _forms(x)
+    out = []
+    for net in list(base_ips) + ["%s/32" % ip for ip in extra_ips]:
+        key = net.strip()
+        if key and not (_forms(key) & seen):
+            seen |= _forms(key)
+            out.append(key)
+    return out
+
+
+def _with_extended_allowed_ips(conf_text, allowed_ips):
+    """Return conf_text with the [Peer] AllowedIPs line replaced. Pure."""
+    def _repl_peer(m):
+        body = m.group(1)
+        new_body = re.sub(r"^AllowedIPs\s*=.*$",
+                          "AllowedIPs = " + ", ".join(allowed_ips),
+                          body, flags=re.MULTILINE | re.IGNORECASE)
+        return "[Peer]" + new_body
+    return re.sub(r"^\[Peer\](.*?)(?=^\[|\Z)", _repl_peer, conf_text,
+                  flags=re.MULTILINE | re.DOTALL)
+
+
+def prepare_active_conf(conf):
+    """Build the runtime .conf for this connection.
+
+    Returns (active_conf_path, nets) where nets is the list of IPv4
+    networks (e.g. ["128.116.0.0/17", "104.18.2.63/32", ...]) the caller
+    must route through the tunnel and remove on disconnect. On any
+    failure returns (conf, ROBLOX_ALLOWED_IPS) -- the game keeps working.
+    """
+    try:
+        with open(conf, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return conf, list(ROBLOX_ALLOWED_IPS)
+    try:
+        endpoint_ips = _resolve_host_ips(_conf_endpoint_host(text) or "")
+        extra = [ip for ip in resolve_roblox_ips(load_roblox_domains())
+                 if ip not in endpoint_ips]
+        allowed = extend_allowed_ips(ROBLOX_ALLOWED_IPS, extra,
+                                     exclude_ips=endpoint_ips)
+        active = os.path.join(app_dir(), TUNNEL_NAME + ".active.conf")
+        with open(active, "w", encoding="utf-8") as f:
+            f.write(_with_extended_allowed_ips(text, allowed))
+        return active, allowed
+    except Exception as e:  # noqa: BLE001 -- never break connect on this
+        _stealth_log("domain-aware split tunnel failed (%r); falling back "
+                     "to %s" % (e, ROBLOX_ALLOWED_IPS))
+        return conf, list(ROBLOX_ALLOWED_IPS)
 
 
 def _fix_dns_for_split_tunnel(text):
@@ -577,6 +724,11 @@ class AmneziaWGBackend:
         _run(["sc", "stop", SERVICE_NAME])
         _wait_service_stopped()
         _run([self.amneziawg, "/uninstalltunnelservice", TUNNEL_NAME])
+        # domain-aware split tunnel: the Windows service routes AllowedIPs
+        # itself, so extending them in a runtime conf covers web/auth/chat
+        # endpoints outside 128.116.0.0/17 (e.g. auth.roblox.com on
+        # Cloudflare) instead of leaking the real IP at login.
+        conf = prepare_active_conf(conf)[0]
         ok, out = _run([self.amneziawg, "/installtunnelservice", conf])
         if not ok:
             raise TunnelError("installtunnelservice failed:\n" + out.strip())
@@ -900,6 +1052,12 @@ class StealthBackend:
         if not ip:
             raise TunnelError("could not read Address from config")
         self._if_ip = ip
+        # domain-aware split tunnel: auth/chat/web endpoints outside
+        # 128.116.0.0/17 (e.g. auth.roblox.com on Cloudflare) must also
+        # go through the tunnel, or Roblox geo-locks the session at login
+        # ("Chat is not available in your region").
+        active_conf, self._active_nets = prepare_active_conf(conf)
+        _stealth_log("split-tunnel nets: %d" % len(self._active_nets))
         # wintun.dll must sit next to the exe
         dll = _stealth_bin(WINTUN_DLL)
         exe_dir = os.path.dirname(self._exe)
@@ -925,7 +1083,7 @@ class StealthBackend:
         _stealth_log("launching stealth-wg.exe ...")
         try:
             self.proc = subprocess.Popen(
-                [self._exe, conf, self._ifname],
+                [self._exe, active_conf, self._ifname],
                 stdout=subprocess.PIPE, stderr=err_log,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
                 **_no_window())
@@ -970,8 +1128,9 @@ class StealthBackend:
         if not ok:
             self.disconnect()
             raise TunnelError("could not set tunnel IP:\n" + out.strip())
-        # Roblox-only route via the tunnel
-        for net4 in ROBLOX_ALLOWED_IPS:
+        # Roblox-only routes via the tunnel (game range + resolved
+        # web/auth/chat IPs)
+        for net4 in self._active_nets:
             addr, bits = net4.split("/")
             mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
                             for i in (24, 16, 8, 0))
@@ -984,7 +1143,7 @@ class StealthBackend:
         _stealth_log("=== connect() done ===")
 
     def disconnect(self):
-        for net4 in ROBLOX_ALLOWED_IPS:
+        for net4 in getattr(self, "_active_nets", ROBLOX_ALLOWED_IPS):
             addr, bits = net4.split("/")
             mask = ".".join(str((0xFFFFFFFF << (32 - int(bits)) >> i) & 0xFF)
                             for i in (24, 16, 8, 0))
@@ -2055,6 +2214,28 @@ def run_self_tests():
           and not _is_private_ip("172.15.0.5"))
     check("_is_private_ip public",
           not _is_private_ip("1.1.1.1") and not _is_private_ip("8.8.8.8"))
+    ext = extend_allowed_ips(["128.116.0.0/17"],
+                             ["104.18.2.63", "104.18.3.63"],
+                             exclude_ips={"104.18.3.63", "203.0.113.7"})
+    check("extend merges /32s minus exclusions",
+          ext == ["128.116.0.0/17", "104.18.2.63/32"], repr(ext))
+    check("extend dedups",
+          extend_allowed_ips(["1.2.3.4/32"], ["1.2.3.4"]) == ["1.2.3.4/32"])
+    cfgx = _with_extended_allowed_ips(
+        plain_cfg, ["128.116.0.0/17", "104.18.2.63/32"])
+    check("active conf extends AllowedIPs",
+          "AllowedIPs = 128.116.0.0/17, 104.18.2.63/32" in cfgx, cfgx[-160:])
+    check("active conf keeps endpoint/keys",
+          "Endpoint = 203.0.113.7:443" in cfgx
+          and "PrivateKey = dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVmZ2g="
+          in cfgx)
+    check("endpoint host parse",
+          _conf_endpoint_host("Endpoint = example.com:443\n") == "example.com"
+          and _conf_endpoint_host("Endpoint = 203.0.113.7:443\n")
+          == "203.0.113.7")
+    check("fallback domains cover auth+chat",
+          "auth.roblox.com" in _FALLBACK_ROBLOX_DOMAINS
+          and "chat.roblox.com" in _FALLBACK_ROBLOX_DOMAINS)
     dns_cfg = ("[Interface]\nPrivateKey = AAA=\nDNS = 10.2.0.1\n"
                "[Peer]\nPublicKey = BBB=\nEndpoint = 203.0.113.7:443\n"
                "AllowedIPs = 0.0.0.0/0\n")
